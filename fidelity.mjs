@@ -3,6 +3,8 @@
 // an assistant message with a tool call. Replay each point with the full prefix before
 // that message (baseline) and with the prefix compacted at each threshold, ask a model for the
 // single next action, and score it against what the agent really did. No LLM judge.
+// The metric is normalized next-action agreement: same tool and same normalized target as the
+// recorded action. It is not task success. Answers that cannot be parsed are not scored.
 //
 // Usage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME]
 //          [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N]
@@ -18,6 +20,11 @@ export const DEFAULT_THRESHOLDS = [0.05, 0.10, 0.15, 0.20, 0.30, 0.50];
 export const DEFAULT_CUTS = 5;
 export const DEFAULT_MAX_CALLS = 60;
 export const DEFAULT_REPEATS = 1;
+// What the reported number is. `METRIC` goes in the JSON, `METRIC_NAME` is what a person reads.
+export const METRIC = 'normalized_next_action_agreement';
+export const METRIC_NAME = 'normalized next-action agreement';
+export const METRIC_DEFINITION = 'the model\'s next tool call has the same tool and the same normalized target as the recorded action ' +
+  '(1.0 same tool and target, 0.5 same tool other target, 0.0 different tool). It is not task success and does not compare what the call does.';
 export const PROMPT_STYLES = ['situation', 'legacy'];
 export const DEFAULT_PROMPT_STYLE = 'situation';
 // The library pins the first message and the newest 6, so a prefix shorter than this has
@@ -370,9 +377,10 @@ export function scoreAction(truth, got) {
   return sameTarget(want, have) ? 1 : 0.5;
 }
 
-// Ask the model once and score the answer. An unparsable answer scores 0 per the bands but
-// is flagged `unparsed` with its raw text, so it never passes for a real disagreement.
-// A provider failure is recorded as an error with no score at all.
+// Ask the model once and score the answer. An unparsable answer is a protocol failure, not
+// evidence that the model disagreed with the recorded action, so it gets no score at all: it
+// is flagged `unparsed` with its raw text and left out of every mean. A provider failure is
+// likewise recorded as an error with no score.
 async function sample(provider, style, transcript, standingTask, truth) {
   const p = buildPrompt(style, transcript, standingTask);
   let raw;
@@ -382,20 +390,24 @@ async function sample(provider, style, transcript, standingTask, truth) {
     return { raw: null, parsed: null, unparsed: false, error: String(e.message ?? e), score: null };
   }
   const parsed = parseAnswer(style, raw);
-  return { raw, parsed, unparsed: parsed === null, score: scoreAction(truth, parsed) };
+  if (parsed === null) return { raw, parsed: null, unparsed: true, score: null };
+  return { raw, parsed, unparsed: false, score: scoreAction(truth, parsed) };
 }
 
 const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
 
-// Sample one condition `repeats` times. Errored samples are kept and counted but left out of
-// the score statistics; `score` is the mean over the rest, null if every sample errored.
+// Sample one condition `repeats` times. Unparsed and errored samples are kept and counted but
+// left out of the score statistics: `n` is the number of parsed samples, `score` is the mean
+// over those, and `status` says why there is no score when there is none: `unparsed_all` (no
+// parsed sample, at least one unparsed answer) or `error_all` (every call failed).
 async function attempt(provider, style, transcript, standingTask, truth, repeats) {
   const samples = [];
   for (let i = 0; i < repeats; i++) samples.push(await sample(provider, style, transcript, standingTask, truth));
   const scores = samples.filter((s) => s.score !== null).map((s) => s.score);
+  const unparsed = samples.filter((s) => s.unparsed).length;
   return {
-    repeats, n: scores.length, errors: repeats - scores.length,
-    unparsed: samples.filter((s) => s.score !== null && s.unparsed).length,
+    repeats, n: scores.length, errors: repeats - scores.length - unparsed, unparsed,
+    status: scores.length ? 'scored' : unparsed ? 'unparsed_all' : 'error_all',
     exact: scores.filter((x) => x === 1).length,
     score: mean(scores), min: scores.length ? Math.min(...scores) : null, max: scores.length ? Math.max(...scores) : null,
     samples,
@@ -506,13 +518,13 @@ export function formatPlan(messages, sel, thresholds, plan, opts) {
 }
 
 // Baseline verdict over `repeats` samples: reproduced when at least ceil(repeats / 2) score
-// exactly 1.0. Errored samples are neither hits nor misses: if they could have tipped the
-// verdict the cut point is a baseline_error, and only a miss that holds even if every error
-// had matched is a baseline_miss.
+// exactly 1.0. Failed and unparsable samples are neither hits nor misses: if they could have
+// tipped the verdict the cut point is a baseline_error, and only a miss that holds even if
+// every one of them had matched is a baseline_miss.
 export function baselineStatus(b) {
   const need = Math.ceil(b.repeats / 2);
   if (b.exact >= need) return 'scored';
-  return b.exact + b.errors >= need ? 'baseline_error' : 'baseline_miss';
+  return b.exact + b.errors + b.unparsed >= need ? 'baseline_error' : 'baseline_miss';
 }
 
 export async function runFidelity({ messages, cuts, thresholds, provider, compactor, repeats = DEFAULT_REPEATS, promptStyle = DEFAULT_PROMPT_STYLE }) {
@@ -530,7 +542,12 @@ export async function runFidelity({ messages, cuts, thresholds, provider, compac
       let at;
       try { at = await compactor.prepare(prefix); } catch (e) { r.status = 'compaction_error'; r.error = String(e.message ?? e); }
       for (const t of r.status === 'scored' ? thresholds : []) {
-        const text = renderContext(at(t).messages);
+        let text;
+        try { text = renderContext(at(t).messages); } catch (e) {
+          // this threshold only: record it, count it, and carry on with the others
+          r.conditions.push({ threshold: t, status: 'compaction_error', error: String(e.message ?? e), charsBefore: fullText.length, repeats, n: 0, errors: 0, unparsed: 0, exact: 0, score: null, min: null, max: null, samples: [] });
+          continue;
+        }
         r.conditions.push({ threshold: t, charsBefore: fullText.length, charsAfter: text.length, saved: 1 - text.length / fullText.length, ...(await attempt(provider, promptStyle, text, cut.instruction, cut.truth, repeats)) });
       }
     }
@@ -540,9 +557,12 @@ export async function runFidelity({ messages, cuts, thresholds, provider, compac
 }
 
 // Per threshold, over cut points whose baseline reproduced the real action. `meanAgreement`
-// is the mean over cut points of each cut point's mean over its repeats; min and max are over
-// individual samples, so run-to-run variance stays visible. Errored samples are counted in
-// `errors` and left out of everything else.
+// (normalized next-action agreement) is the mean over cut points of each cut point's mean over
+// its parsed samples; min and max are over individual parsed samples, so run-to-run variance
+// stays visible. Unparsed answers and failed calls are never scored: they are counted in
+// `unparsed` and `errors`, and `samples_parsed` of `samples_total` says how many answers the
+// mean rests on. A condition with no parsed sample (`unparsed_all`, or every call failed) and
+// a condition whose compaction threw (`compaction_errors`) are left out of n and the means.
 export function aggregate(results, thresholds) {
   const scored = results.filter((r) => r.status === 'scored');
   return thresholds.map((t) => {
@@ -550,11 +570,12 @@ export function aggregate(results, thresholds) {
     const ok = cs.filter((c) => c.score !== null);
     const scores = ok.flatMap((c) => c.samples.filter((x) => x.score !== null).map((x) => x.score));
     return {
-      threshold: t, n: ok.length, samples: scores.length, errors: cs.reduce((a, c) => a + c.errors, 0),
+      threshold: t, n: ok.length, samples_parsed: scores.length, samples_total: cs.reduce((a, c) => a + c.samples.length, 0),
+      unparsed: cs.reduce((a, c) => a + c.unparsed, 0), unparsed_all: cs.filter((c) => c.status === 'unparsed_all').length,
+      errors: cs.reduce((a, c) => a + c.errors, 0), compaction_errors: cs.filter((c) => c.status === 'compaction_error').length,
       meanAgreement: mean(ok.map((c) => c.score)),
       minSample: scores.length ? Math.min(...scores) : null, maxSample: scores.length ? Math.max(...scores) : null,
       exactRate: scores.length ? scores.filter((x) => x === 1).length / scores.length : null,
-      unparsed: ok.reduce((a, c) => a + c.unparsed, 0),
       looseTargets: scored.filter((r) => r.looseTarget && ok.includes(r.conditions.find((c) => c.threshold === t))).length,
       meanSaved: mean(ok.map((c) => c.saved)),
     };
@@ -562,14 +583,19 @@ export function aggregate(results, thresholds) {
 }
 
 export function buildJson(meta, results, thresholds) {
-  return { meta, aggregate: aggregate(results, thresholds), cutPoints: results };
+  return { metric: METRIC, meta, aggregate: aggregate(results, thresholds), cutPoints: results };
 }
 
 const f2 = (x) => (x === null ? 'n/a' : x.toFixed(2));
 
-// mean [min-max] n=k, with unparsed / failed counts only when there are some
-const cell = (c) => (c.score === null ? 'err' :
-  `${f2(c.score)} [${f2(c.min)}-${f2(c.max)}] n=${c.n}${c.unparsed ? ` u${c.unparsed}` : ''}${c.errors ? ` e${c.errors}` : ''}`);
+// mean [min-max] n=k over parsed answers, with unparsed / failed counts only when there are some.
+// A mean with unparsed answers behind it carries a `*`: it is conditional on the parsed ones.
+const cell = (c) => {
+  if (c.status === 'compaction_error') return 'compaction_error';
+  if (c.status === 'unparsed_all') return `unparsed_all u${c.unparsed}${c.errors ? ` e${c.errors}` : ''}`;
+  if (c.score === null) return 'err';
+  return `${f2(c.score)}${c.unparsed ? '*' : ''} [${f2(c.min)}-${f2(c.max)}] n=${c.n}${c.unparsed ? ` u${c.unparsed}` : ''}${c.errors ? ` e${c.errors}` : ''}`;
+};
 
 // Holds session text: the truth-action section quotes the real commands and paths so the
 // scoring can be audited. Like the json it is gitignored; do not publish it as is.
@@ -579,10 +605,13 @@ export function buildMarkdown(meta, results, thresholds) {
   const missed = results.filter((r) => r.status === 'baseline_miss');
   const baseErr = results.filter((r) => r.status === 'baseline_error');
   const compErr = results.filter((r) => r.status === 'compaction_error');
+  const compErrConditions = results.flatMap((r) => r.conditions.filter((c) => c.status === 'compaction_error').map((c) => ({ index: r.index, ...c })));
   const repeats = meta.repeats ?? 1;
   const need = Math.ceil(repeats / 2);
   const L = [
-    '# Fidelity eval',
+    `# Fidelity eval: ${METRIC_NAME}`,
+    '',
+    `Metric: **${METRIC_NAME}**, i.e. ${METRIC_DEFINITION}`,
     '',
     `Run ${meta.date}. Provider \`${meta.provider}\`${meta.model ? `, model \`${meta.model}\`` : ''}. ${results.length} cut points, thresholds ${thresholds.join(', ')}.`,
     `Prompt style \`${meta.promptStyle ?? 'legacy'}\`, ${repeats} repeat${repeats === 1 ? '' : 's'} per condition.`,
@@ -592,20 +621,24 @@ export function buildMarkdown(meta, results, thresholds) {
     '',
     `Over the ${scored.length} cut points where the full-context baseline reproduced the real action.`,
     '',
-    'n = cut points, samples = scored model answers behind them. Min and max are over single samples.',
+    'n = cut points with at least one parsed answer. samples = parsed answers / all answers asked behind them. Min and max are over single parsed samples.',
+    `The mean is over parsed answers only. An answer that could not be parsed into an action is a protocol failure, not disagreement: it is counted in \`unparsed\`, its raw text is kept in the JSON, and it is not in the mean. A mean marked \`*\` has unparsed answers behind it and is conditional on the parsed ones. A condition with no parsed answer is \`unparsed_all\` and is left out of n and the mean.`,
     `loose_target = how many of the n cut points have a Bash truth command with no path in it, scored by the weaker fallback (same reduced command 1.0, else 0.5). The more of n that are loose, the less of the mean rests on a signature comparison.`,
     '',
-    '| threshold | n | loose_target | samples | mean agreement | min | max | exact match (of samples) | unparsed | errors | mean context saved |',
-    '|---|---|---|---|---|---|---|---|---|---|---|',
-    ...agg.map((a) => `| ${a.threshold.toFixed(2)} | ${a.n} | ${a.looseTargets} | ${a.samples} | ${f2(a.meanAgreement)} | ${f2(a.minSample)} | ${f2(a.maxSample)} | ${a.exactRate === null ? 'n/a' : pct(a.exactRate)} | ${a.unparsed} | ${a.errors} | ${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)} |`),
+    `| threshold | n | loose_target | samples parsed / total | mean ${METRIC_NAME} (parsed only) | min | max | exact match (of parsed) | unparsed | unparsed_all | errors | compaction_error | mean context saved |`,
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    ...agg.map((a) => `| ${a.threshold.toFixed(2)} | ${a.n} | ${a.looseTargets} | ${a.samples_parsed} / ${a.samples_total} | ${f2(a.meanAgreement)}${a.unparsed ? '*' : ''} | ${f2(a.minSample)} | ${f2(a.maxSample)} | ${a.exactRate === null ? 'n/a' : pct(a.exactRate)} | ${a.unparsed} | ${a.unparsed_all} | ${a.errors} | ${a.compaction_errors} | ${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)} |`),
     '',
+    ...agg.filter((a) => a.unparsed || a.unparsed_all).map((a) => `**Conditional mean at threshold ${a.threshold.toFixed(2)}:** ${a.unparsed} of ${a.samples_total} answers were unparsed and are excluded; the mean rests on ${a.samples_parsed} parsed answers${a.unparsed_all ? `, and ${a.unparsed_all} condition${a.unparsed_all === 1 ? ' had' : 's had'} no parsed answer at all (unparsed_all, left out of n)` : ''}.`),
+    ...(agg.some((a) => a.unparsed || a.unparsed_all) ? [''] : []),
     '## Baseline and exclusions',
     '',
     `Baseline miss rate: ${missed.length} of ${results.length} cut points (${results.length ? pct(missed.length / results.length) : 'n/a'}).`,
     `Excluded from scoring: ${results.length - scored.length} of ${results.length} cut points.`,
-    `- baseline_miss: ${missed.length}. Fewer than ${need} of ${repeats} baseline repeats reproduced the real action (same tool and same target, score exactly 1.0), even counting failed calls as hits, so the cut point says nothing about compaction. Compacted conditions were not run for these.`,
-    `- baseline_error: ${baseErr.length}. Failed baseline model calls left the verdict undecided.`,
-    `- compaction_error: ${compErr.length}. The baseline matched but compaction failed.`,
+    `- baseline_miss: ${missed.length}. Fewer than ${need} of ${repeats} baseline repeats reproduced the real action (same tool and same target, score exactly 1.0), even counting failed and unparsable answers as hits, so the cut point says nothing about compaction. Compacted conditions were not run for these.`,
+    `- baseline_error: ${baseErr.length}. Failed or unparsable baseline answers could have changed the verdict (an unparsable answer is not a hit), so it is undecided rather than a miss.`,
+    `- compaction_error: ${compErr.length}. The baseline matched but compaction could not be prepared for the cut point.`,
+    `- compaction_error conditions: ${compErrConditions.length}. Compaction threw at one threshold of a cut point whose baseline matched; the other thresholds still ran, and n at that threshold is lower.${compErrConditions.map((c) => `\n  - K=${c.index} threshold ${c.threshold}: ${clip(c.error.replace(/\s+/g, ' '), 200)}`).join('')}`,
     `- Cut points never selected: ${meta.candidates - results.length} of ${meta.candidates} candidates (${meta.noInstruction ?? 0} no_instruction, ${meta.tooEarly} prefix too short to compact, ${meta.tooLarge ?? 0} too_large for \`--max-prefix-chars\`, the rest beyond \`--cuts\`).`,
     '',
     '## Truth actions and how they were scored',
@@ -622,7 +655,7 @@ export function buildMarkdown(meta, results, thresholds) {
     '',
     '## Per cut point',
     '',
-    `Cell format: mean [min-max] over repeats, n=scored repeats, then (context saved). \`u<k>\` = k unparsed answers, \`e<k>\` = k failed calls, \`err\` = every call failed.`,
+    `Cell format: ${METRIC_NAME} as mean [min-max] over parsed repeats, n=parsed repeats, then (context saved). \`*\` = the mean leaves out unparsed answers, \`u<k>\` = k unparsed answers, \`e<k>\` = k failed calls, \`unparsed_all\` = no answer could be parsed, \`compaction_error\` = compaction threw at this threshold, \`err\` = every call failed.`,
     '',
     `| K | status | baseline | ${thresholds.map((t) => t.toFixed(2)).join(' | ')} |`,
     `|---|---|---|${thresholds.map(() => '---').join('|')}|`,
@@ -636,7 +669,8 @@ export function buildMarkdown(meta, results, thresholds) {
     '',
     '## How to read this',
     '',
-    '- Agreement: 1.0 same tool and target, 0.5 same tool other target, 0.0 different tool or unparsable answer. Deterministic, no judge.',
+    `- Normalized next-action agreement: 1.0 same tool and target, 0.5 same tool other target, 0.0 different tool. Deterministic, no judge. It is not task success: two different edits to the same file agree.`,
+    '- An unparsable answer is not scored. It is not counted as disagreement: it is excluded from the mean and the exact rate, counted per threshold, and its raw text is in the JSON. A baseline sample that is unparsable is not a hit, and if it could have changed the baseline verdict the cut point is `baseline_error`, not `baseline_miss`.',
     '- Bash targets are compared by signature: same program, module and path set 1.0 (so a rewritten inline script against the same files matches), same program but another path set or module 0.5, different program 0.0. A truth with no path (`loose_target`) is compared by program plus first argument instead: equal 1.0, else 0.5.',
     `- A baseline counts as reproduced when at least ${need} of ${repeats} repeats scored exactly 1.0; cut points where it did not are excluded. The table shows the loss relative to a baseline that worked, not absolute accuracy. Repeats that missed on a kept cut point still show in its baseline cell.`,
     '- Every threshold at a cut point is judged on one shared Jev pass, so thresholds are comparable with each other. Jev has run to run variance (see FINDINGS.md), so a fresh run can differ.',
@@ -649,6 +683,14 @@ export function buildMarkdown(meta, results, thresholds) {
 }
 
 // ---------------------------------------------------------------- cli
+
+const USAGE = 'usage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME] [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N] [--max-prefix-chars N] [--repeats N] [--prompt-style situation|legacy] [--dry-run] [--help]';
+const HELP = [
+  USAGE,
+  '',
+  `Reports ${METRIC_NAME}: ${METRIC_DEFINITION}`,
+  'Answers that cannot be parsed are not scored: they are counted, kept raw in the JSON, and left out of every mean.',
+].join('\n');
 
 export function parseArgs(argv) {
   const o = { cuts: DEFAULT_CUTS, thresholds: DEFAULT_THRESHOLDS, provider: 'claude', maxCalls: DEFAULT_MAX_CALLS, maxPrefixChars: MAX_PREFIX_CHARS, repeats: DEFAULT_REPEATS, promptStyle: DEFAULT_PROMPT_STYLE, dryRun: false };
@@ -684,9 +726,10 @@ export function parseArgs(argv) {
 // `deps` lets tests inject a provider and compactor. Returns the process exit code.
 export async function main(argv, deps = {}) {
   const log = deps.log ?? console.log;
+  if (argv.includes('--help') || argv.includes('-h')) { log(HELP); return 0; }
   let o;
   try { o = parseArgs(argv); } catch (e) {
-    console.error(`${e.message}\nusage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME] [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N] [--max-prefix-chars N] [--repeats N] [--prompt-style situation|legacy] [--dry-run]`);
+    console.error(`${e.message}\n${USAGE}`);
     return 2;
   }
   const messages = JSON.parse(readFileSync(o.input, 'utf8'));
@@ -715,7 +758,10 @@ export async function main(argv, deps = {}) {
   writeFileSync(`${o.out}-fidelity.json`, JSON.stringify(buildJson(meta, results, o.thresholds), null, 2));
   writeFileSync(`${o.out}-fidelity.md`, buildMarkdown(meta, results, o.thresholds));
   log(`wrote ${o.out}-fidelity.json and ${o.out}-fidelity.md (${meta.modelCalls} model calls, ${meta.jevRequests} Jev requests)`);
-  for (const a of aggregate(results, o.thresholds)) log(`  t=${a.threshold.toFixed(2)}  n=${a.n}  loose_target=${a.looseTargets}  agreement=${f2(a.meanAgreement)}  saved=${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)}`);
+  for (const a of aggregate(results, o.thresholds)) {
+    log(`  t=${a.threshold.toFixed(2)}  n=${a.n}  loose_target=${a.looseTargets}  ${METRIC_NAME}=${f2(a.meanAgreement)}${a.unparsed ? '*' : ''} (parsed ${a.samples_parsed}/${a.samples_total}, unparsed=${a.unparsed}, unparsed_all=${a.unparsed_all}, errors=${a.errors}, compaction_error=${a.compaction_errors})  saved=${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)}`);
+    if (a.unparsed) log(`    * ${a.unparsed} unparsed answer${a.unparsed === 1 ? '' : 's'} excluded from the mean; it is conditional on the parsed ones`);
+  }
   return 0;
 }
 

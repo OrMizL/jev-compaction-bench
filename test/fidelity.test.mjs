@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import {
   selectCutPoints, renderContext, normaliseTarget, sameTarget, scoreAction, parseAction,
   runFidelity, aggregate, buildMarkdown, fakeCompactor, main, planFor, commandSignature, describeTruth,
-  buildPrompt, parseToolLine, parseAnswer, baselineStatus, formatPlan,
+  buildPrompt, parseToolLine, parseAnswer, baselineStatus, formatPlan, buildJson, METRIC,
 } from '../fidelity.mjs';
 import { fakeProvider } from '../providers.mjs';
 
@@ -253,7 +253,7 @@ function scripted(answers) {
 }
 const truthOf = (cut) => JSON.stringify({ tool: cut.truth.tool, input: cut.truth.input });
 
-test('unparsed answers are recorded with raw text, flagged, and never dropped', async () => {
+test('unparsed answers are recorded with raw text and flagged, but not scored', async () => {
   const { cuts } = selectCutPoints(messages, { cuts: 1 });
   const provider = scripted([truthOf(cuts[0]), 'no idea, sorry', truthOf(cuts[0])]);
   const results = await runFidelity({ messages, cuts, thresholds: [0.1, 0.3], provider, compactor: fakeCompactor() });
@@ -264,11 +264,12 @@ test('unparsed answers are recorded with raw text, flagged, and never dropped', 
   assert.equal(bad.samples[0].unparsed, true);
   assert.equal(bad.samples[0].parsed, null);
   assert.equal(bad.samples[0].raw, 'no idea, sorry');
-  assert.equal(bad.score, 0);
+  assert.equal(bad.score, null); // was 0 before the honesty fix: a parse failure is not disagreement
+  assert.equal(bad.status, 'unparsed_all');
   const agg = aggregate(results, [0.1, 0.3]);
   assert.equal(agg[0].unparsed, 1);
   assert.equal(agg[1].unparsed, 0);
-  assert.equal(agg[0].n, 1); // still counted, not skipped
+  assert.equal(agg[0].n, 0); // no parsed answer: excluded from n and the mean
 });
 
 test('a provider failure is an error with no score, not a zero', async () => {
@@ -304,10 +305,11 @@ test('a baseline miss excludes the cut point, skips its compacted runs, and is c
   assert.match(md, /baseline_miss: 1/);
 });
 
-test('an unparsable baseline is also a baseline miss', async () => {
+test('an unparsable baseline that could have decided the verdict is baseline_error, not baseline_miss', async () => {
   const { cuts } = selectCutPoints(messages, { cuts: 1 });
   const results = await runFidelity({ messages, cuts, thresholds: [0.15], provider: fakeProvider('hello'), compactor: fakeCompactor() });
-  assert.equal(results[0].status, 'baseline_miss');
+  assert.equal(results[0].status, 'baseline_error'); // was baseline_miss before the honesty fix
+  assert.equal(results[0].conditions.length, 0);
   assert.equal(results[0].baseline.samples[0].unparsed, true);
   assert.equal(results[0].baseline.samples[0].raw, 'hello');
 });
@@ -462,7 +464,7 @@ test('repeats: a baseline matching in 1 of 3 repeats is excluded, 2 of 3 is kept
 });
 
 test('repeats: even N needs half (ceil(N/2)), and errors that could tip the verdict make it baseline_error', () => {
-  const b = (repeats, exact, errors) => ({ repeats, exact, errors });
+  const b = (repeats, exact, errors, unparsed = 0) => ({ repeats, exact, errors, unparsed });
   assert.equal(baselineStatus(b(4, 2, 0)), 'scored');
   assert.equal(baselineStatus(b(4, 1, 0)), 'baseline_miss');
   assert.equal(baselineStatus(b(3, 1, 0)), 'baseline_miss');
@@ -470,6 +472,11 @@ test('repeats: even N needs half (ceil(N/2)), and errors that could tip the verd
   assert.equal(baselineStatus(b(3, 0, 1)), 'baseline_miss'); // misses even if it had
   assert.equal(baselineStatus(b(1, 0, 1)), 'baseline_error');
   assert.equal(baselineStatus(b(1, 1, 0)), 'scored');
+  // unparsable answers are not hits, and undecided like failed calls
+  assert.equal(baselineStatus(b(3, 1, 0, 1)), 'baseline_error');
+  assert.equal(baselineStatus(b(3, 0, 0, 1)), 'baseline_miss'); // misses even if it had parsed and matched
+  assert.equal(baselineStatus(b(3, 1, 1, 1)), 'baseline_error');
+  assert.equal(baselineStatus(b(3, 2, 0, 1)), 'scored'); // an unparsable sample never takes a hit away
 });
 
 test('repeats: condition reports mean, min, max and repeat count; errored samples are counted, not averaged', async () => {
@@ -489,7 +496,7 @@ test('repeats: condition reports mean, min, max and repeat count; errored sample
   assert.equal(c.min, 0.5);
   assert.equal(c.max, 1);
   const [a] = aggregate(results, [0.3]);
-  assert.deepEqual([a.n, a.samples, a.errors], [1, 2, 1]);
+  assert.deepEqual([a.n, a.samples_parsed, a.samples_total, a.errors], [1, 2, 3, 1]);
   assert.equal(a.meanAgreement, 0.75);
   assert.equal(a.minSample, 0.5);
   assert.equal(a.maxSample, 1);
@@ -552,5 +559,155 @@ test('a full fake run with repeats and both prompt styles writes reports that st
       assert.equal(json.meta.modelCalls, 2 * (2 + scored)); // repeats x (2 baselines + 1 threshold per scored cut)
       assert.match(readFileSync(`${out}-fidelity.md`, 'utf8'), new RegExp(`Prompt style \`${style}\`, 2 repeats per condition`));
     }
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+// ---- honesty fixes: unparsed answers, compaction failures, metric name
+
+// same tool as the truth, a different target: scores 0.5
+const halfOf = (cut) => JSON.stringify({ tool: cut.truth.tool, input: { file_path: '/elsewhere/x', command: 'zz', pattern: 'zz', path: '/elsewhere/x' } });
+const mdMeta = (extra = {}) => ({ date: 'd', provider: 'fake', repeats: 1, promptStyle: 'situation', modelCalls: 0, jevRequests: 0, candidates: 1, tooEarly: 0, ...extra });
+
+test('unparsed answers are excluded from the mean, counted, and marked in the report', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  // baseline 3 exact; threshold 0.3: exact, unparsed, half. Counted as 0 the mean would be 0.50, over the parsed ones it is 0.75.
+  const provider = scripted([...Array(3).fill(truthOf(cuts[0])), truthOf(cuts[0]), 'I am not sure what to do', halfOf(cuts[0])]);
+  const results = await runFidelity({ messages, cuts, thresholds: [0.3], provider, compactor: fakeCompactor(), repeats: 3 });
+  const c = results[0].conditions[0];
+  assert.equal(c.status, 'scored');
+  assert.deepEqual([c.repeats, c.n, c.unparsed, c.errors], [3, 2, 1, 0]);
+  assert.equal(c.score, 0.75);
+  assert.equal(c.min, 0.5);
+  assert.equal(c.samples[1].raw, 'I am not sure what to do'); // raw text of the unparsable answer is kept
+  assert.equal(c.samples[1].score, null);
+  const [a] = aggregate(results, [0.3]);
+  assert.deepEqual([a.n, a.samples_parsed, a.samples_total, a.unparsed, a.unparsed_all, a.errors], [1, 2, 3, 1, 0, 0]);
+  assert.equal(a.meanAgreement, 0.75);
+  assert.equal(a.exactRate, 0.5); // 1 exact of 2 parsed, not of 3 asked
+  const md = buildMarkdown(mdMeta({ repeats: 3 }), results, [0.3]);
+  assert.match(md, /\| 0\.30 \| 1 \| 0 \| 2 \/ 3 \| 0\.75\* \|/); // parsed / total, and the mean is starred
+  assert.match(md, /0\.75\* \[0\.50-1\.00\] n=2 u1/);
+  assert.match(md, /Conditional mean at threshold 0\.30:\*\* 1 of 3 answers were unparsed and are excluded/);
+  assert.match(md, /A mean marked `\*` has unparsed answers behind it/);
+  // a mean with nothing unparsed behind it is not starred and gets no warning
+  const clean = buildMarkdown(mdMeta({ repeats: 3 }), await runFidelity({ messages, cuts, thresholds: [0.3], provider: fakeProvider(truthOf(cuts[0])), compactor: fakeCompactor(), repeats: 3 }), [0.3]);
+  assert.doesNotMatch(clean, /Conditional mean/);
+  assert.doesNotMatch(clean, /\d\*/);
+});
+
+test('a condition with only unparsable answers is unparsed_all: excluded from n and the mean, and flagged', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 2 });
+  // one call per condition. cut 0: baseline, then threshold 0.3 unparsable, then 0.5 exact. cut 1: all exact.
+  const provider = scripted([truthOf(cuts[0]), 'no idea', truthOf(cuts[0]), truthOf(cuts[1]), truthOf(cuts[1]), truthOf(cuts[1])]);
+  const results = await runFidelity({ messages, cuts, thresholds: [0.3, 0.5], provider, compactor: fakeCompactor() });
+  assert.equal(results[0].status, 'scored'); // the baseline held, so this is a compacted-condition problem, not a miss
+  assert.equal(results[0].conditions[0].status, 'unparsed_all');
+  assert.equal(results[0].conditions[0].score, null);
+  assert.equal(results[0].conditions[0].samples[0].raw, 'no idea');
+  const [lo, hi] = aggregate(results, [0.3, 0.5]);
+  assert.deepEqual([lo.n, lo.unparsed, lo.unparsed_all, lo.samples_parsed, lo.samples_total], [1, 1, 1, 1, 2]);
+  assert.equal(lo.meanAgreement, 1); // only cut 1 is in the mean; counting cut 0 as 0 would give 0.5
+  assert.equal(lo.meanSaved, results[1].conditions[0].saved); // savings of the excluded condition are excluded too
+  assert.deepEqual([hi.n, hi.unparsed, hi.unparsed_all], [2, 0, 0]);
+  const md = buildMarkdown(mdMeta({ candidates: 2 }), results, [0.3, 0.5]);
+  assert.match(md, /unparsed_all u1/);
+  assert.match(md, /1 conditions? had no parsed answer at all \(unparsed_all, left out of n\)/);
+  // a threshold where nothing parsed at all has no mean rather than a zero
+  const none = await runFidelity({ messages, cuts: cuts.slice(0, 1), thresholds: [0.3], provider: scripted([truthOf(cuts[0]), 'x']), compactor: fakeCompactor() });
+  assert.equal(aggregate(none, [0.3])[0].meanAgreement, null);
+  assert.equal(aggregate(none, [0.3])[0].n, 0);
+});
+
+test('an unparsable baseline sample that could flip the verdict is baseline_error; one that could not is baseline_miss', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  const wrong = '{"tool":"Glob","input":{"pattern":"*"}}';
+  const run = (answers) => {
+    const provider = scripted(answers);
+    return runFidelity({ messages, cuts, thresholds: [0.3], provider, compactor: fakeCompactor(), repeats: 3 }).then((results) => ({ results, provider }));
+  };
+  // 1 exact + 1 unparsable of 3: needs 2, so the unparsable one might have been the second hit
+  const flip = await run([truthOf(cuts[0]), 'gibberish', wrong]);
+  assert.equal(flip.results[0].status, 'baseline_error');
+  assert.equal(flip.results[0].baseline.unparsed, 1);
+  assert.equal(flip.results[0].baseline.samples[1].raw, 'gibberish');
+  assert.equal(flip.results[0].conditions.length, 0);
+  assert.equal(flip.provider.calls, 3); // no compacted condition was run for the undecided cut point
+  // 0 exact + 1 unparsable of 3: even a hit would leave it at 1 of 2 needed
+  const settled = await run([wrong, wrong, 'gibberish']);
+  assert.equal(settled.results[0].status, 'baseline_miss');
+  const md = buildMarkdown(mdMeta({ repeats: 3 }), flip.results, [0.3]);
+  assert.match(md, /baseline_error: 1\. Failed or unparsable baseline answers could have changed the verdict/);
+  assert.match(md, /baseline_miss: 0\./);
+});
+
+test('a compactor that throws at one threshold gives a compaction_error for it, and the run still completes and writes both files', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fid-'));
+  try {
+    const { cuts } = selectCutPoints(messages, { cuts: 1 });
+    const compactor = {
+      name: 'flaky', jevRequests: 0,
+      async prepare(prefix) {
+        const ok = fakeCompactor().prepare(prefix);
+        return ok.then((at) => (t) => { if (t === 0.3) throw new Error('decision ladder exploded'); return at(t); });
+      },
+    };
+    // two repeats: baseline 2 exact; 0.15: exact + unparsable; 0.3 throws before any call; 0.5: 2 exact
+    const provider = scripted([truthOf(cuts[0]), truthOf(cuts[0]), truthOf(cuts[0]), 'no idea', truthOf(cuts[0]), truthOf(cuts[0])]);
+    const lines = [];
+    const out = join(dir, 'run');
+    const code = await main([FIXTURE, '--cuts', '1', '--thresholds', '0.15,0.3,0.5', '--repeats', '2', '--out', out], { provider, compactor, log: (l) => lines.push(l) });
+    assert.equal(code, 0);
+    assert.equal(provider.calls, 2 + 2 + 2); // the failing threshold made no calls; the others still ran
+
+    const json = JSON.parse(readFileSync(`${out}-fidelity.json`, 'utf8'));
+    assert.equal(json.metric, 'normalized_next_action_agreement');
+    const conds = json.cutPoints[0].conditions;
+    assert.deepEqual(conds.map((c) => [c.threshold, c.status]), [[0.15, 'scored'], [0.3, 'compaction_error'], [0.5, 'scored']]);
+    assert.equal(conds[1].error, 'decision ladder exploded');
+    assert.equal(json.cutPoints[0].status, 'scored'); // the cut point is still scored at the other thresholds
+    assert.deepEqual(json.aggregate.map((a) => a.compaction_errors), [0, 1, 0]);
+    assert.deepEqual(json.aggregate.map((a) => a.n), [1, 0, 1]);
+    assert.equal(json.aggregate[1].meanAgreement, null);
+    assert.deepEqual([json.aggregate[0].unparsed, json.aggregate[0].samples_parsed, json.aggregate[0].samples_total], [1, 1, 2]);
+
+    const md = readFileSync(`${out}-fidelity.md`, 'utf8');
+    assert.match(md, /compaction_error conditions: 1\./);
+    assert.match(md, new RegExp(`K=${cuts[0].index} threshold 0\\.3: decision ladder exploded`));
+    assert.match(md, /\| 0\.30 \| 0 \|.*\| 1 \|/);
+    assert.match(md, /compaction_error \(n\/a\)/);
+    assert.match(md, /Conditional mean at threshold 0\.15/);
+    assert.match(lines.join('\n'), /t=0\.30 .*compaction_error=1/);
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+test('a compactor whose prepare throws is still a counted compaction_error for the cut point', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  const compactor = { name: 'broken', jevRequests: 0, async prepare() { throw new Error('jev is down'); } };
+  const results = await runFidelity({ messages, cuts, thresholds: [0.3], provider: fakeProvider(truthOf(cuts[0])), compactor });
+  assert.equal(results[0].status, 'compaction_error');
+  assert.equal(results[0].error, 'jev is down');
+  assert.match(buildMarkdown(mdMeta(), results, [0.3]), /compaction_error: 1\./);
+});
+
+test('the metric is named for what it measures in the JSON, the report, the console summary and --help', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fid-'));
+  try {
+    const out = join(dir, 'run');
+    const lines = [];
+    assert.equal(await main([FIXTURE, '--provider', 'fake', '--cuts', '1', '--thresholds', '0.15', '--out', out], { log: (l) => lines.push(l) }), 0);
+    assert.equal(JSON.parse(readFileSync(`${out}-fidelity.json`, 'utf8')).metric, METRIC);
+    assert.equal(METRIC, 'normalized_next_action_agreement');
+    const md = readFileSync(`${out}-fidelity.md`, 'utf8');
+    assert.match(md, /^# Fidelity eval: normalized next-action agreement/);
+    assert.match(md, /mean normalized next-action agreement \(parsed only\)/);
+    assert.match(md, /- Normalized next-action agreement: 1\.0 same tool and target/);
+    assert.match(md, /It is not task success/);
+    assert.doesNotMatch(md, /mean agreement|unparsable answer\.\s*Deterministic/); // no bare "agreement" headers, no 0.0-for-unparsable band
+    assert.match(lines.join('\n'), /t=0\.15 .*normalized next-action agreement=/);
+    const help = [];
+    assert.equal(await main(['--help'], { log: (l) => help.push(l) }), 0);
+    assert.match(help.join('\n'), /normalized next-action agreement/);
+    assert.match(help.join('\n'), /not task success/);
+    assert.match(help.join('\n'), /not scored/);
   } finally { rmSync(dir, { recursive: true }); }
 });

@@ -98,25 +98,36 @@ built `dist/`.
 
 ## How the scoring works
 
-1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool or an
-unparsable answer. No LLM judge. Targets are compared after normalising paths. A shell command is
+The number the harness reports is **normalized next-action agreement**: 1.0 same tool and same target,
+0.5 same tool with a different target, 0.0 different tool. It is not task success, and two different
+edits to the same file agree. No LLM judge. Targets are compared after normalising paths. A shell command is
 compared by signature (its program, any `python3 -m` module, and the set of paths it names), so an inline
 script rewritten against the same files still matches: same program and paths 1.0, same program other
 paths 0.5, another program 0.0. A truth command naming no path is flagged `loose_target` and scored by a
 weaker rule, and the reports count those per threshold.
 
+An answer the harness cannot parse into an action is a protocol failure, not disagreement, so it is not
+scored. Each threshold's mean is over the parsed answers only. The reports give `samples_parsed` next to
+`samples_total`, count `unparsed`, and star any mean that has unparsed answers behind it; the raw text of
+every unparsable answer is kept in the JSON. A condition with no parsed answer is `unparsed_all` and is left
+out of the mean, like a condition where every call failed. If a compaction call throws at one threshold, that
+moment and threshold is recorded as `compaction_error`, counted, and the other thresholds still run.
+
 Conditions per moment: `full` (the baseline) and the prefix compacted at each threshold. If the baseline
 does not reproduce the real action, the moment is `baseline_miss` and is excluded, and the report says how
 many. Every condition is sampled `--repeats N` times; the baseline counts as reproduced when at least
-`ceil(N/2)` repeats score exactly 1.0. Jev is asked once per moment and every threshold reuses those
-answers through the library's own decision ladder, so thresholds are compared on identical judgements.
+`ceil(N/2)` repeats score exactly 1.0. An unparsable or failed baseline sample is not a hit; if it could
+have changed that verdict the moment is `baseline_error` (undecided) instead of `baseline_miss`. Jev is
+asked once per moment and every threshold reuses those answers through the library's own decision ladder,
+so thresholds are compared on identical judgements.
 
 Options: `--cuts N`, `--thresholds LIST`, `--model`, `--provider claude|openrouter|fake`, `--out PREFIX`,
 `--max-calls N` (aborts before calling if the plan is larger; nothing is trimmed to fit),
 `--max-prefix-chars N` (oversized prefixes are skipped and reported as `too_large`, never truncated),
-`--repeats N`, `--prompt-style situation|legacy`, `--dry-run`.
+`--repeats N`, `--prompt-style situation|legacy`, `--dry-run`, `--help`.
 
 Output: `PREFIX-fidelity.json` and `PREFIX-fidelity.md`, both gitignored because they hold session text.
+The JSON carries `metric: "normalized_next_action_agreement"` so a consumer cannot mistake it for task success.
 
 ## Status
 
@@ -131,8 +142,10 @@ Output: `PREFIX-fidelity.json` and `PREFIX-fidelity.md`, both gitignored because
 
 - One model under test (headless Claude Code), one prompt style per comparison, one session. Treat this
   as a preliminary measurement, which is how it is written.
-- Unparsable answers are counted and reported per threshold, but they are currently scored as 0 agreement
-  and included in the means. Read the `unparsed` column next to any mean that matters.
+- Unparsable answers are excluded from the means, not scored as disagreement. They are counted per
+  threshold (`unparsed`, next to `samples_parsed` of `samples_total`) and a mean with any behind it is
+  starred, so read a starred mean as conditional on the answers that parsed. A model that often fails the
+  answer format can therefore look better than it is: check `samples_parsed` before quoting a mean.
 - The adapter drops `thinking` blocks when reshaping a transcript, which yields empty messages on input.
   That is a property of this tool, not of the library.
 - Jev's answers have small run-to-run variance, so a threshold simulation built from one run is not a
