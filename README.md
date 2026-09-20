@@ -56,8 +56,12 @@ the `most recent state`, then one ask (`TOOL <name> <target>`). `--prompt-style 
 sends the old fresh-instruction/JSON prompt instead, for comparison on the same cut points.
 That answer is scored against the real one:
 1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool
-or an unparsable answer. Targets are compared after normalising paths and reducing shell
-commands to program plus first argument. No LLM judge.
+or an unparsable answer. Targets are compared after normalising paths. A shell command is
+compared by signature (its program, `python3 -m` module and the set of paths it names), so an
+inline script rewritten against the same files still matches: same program, module and paths
+1.0, same program with other paths 0.5, another program 0.0. A truth command that names no
+path is flagged `loose_target` and scored by the older program-plus-first-argument rule; the
+reports count those per threshold. No LLM judge.
 
 Conditions per cut point: `full` (the baseline) and the prefix compacted at each
 threshold in the sweep. If the baseline does not reproduce the real action, the cut
@@ -93,8 +97,8 @@ context, from a scratch directory.
 
 Output: `PREFIX-fidelity.json` (raw answers, parsed and true actions, scores, context
 size before and after) and `PREFIX-fidelity.md` (threshold, mean agreement, mean context
-saved, baseline miss rate, and what was excluded and why). Both are gitignored because
-the json holds session text. Unparsable answers are kept with their raw text, counted as
+saved, baseline miss rate, what was excluded and why, and each cut point's real action next
+to the signature it was scored by). Both are gitignored because they hold session text. Unparsable answers are kept with their raw text, counted as
 `unparsed`, and never silently dropped. Tests: `node --test` (fake provider only).
 
 ## Findings so far

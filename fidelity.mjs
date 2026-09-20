@@ -181,6 +181,13 @@ export function parseAnswer(style, raw) {
   return style === 'legacy' ? parseAction(raw) : (parseToolLine(raw) ?? parseAction(raw));
 }
 
+// `src/a.mjs` agrees with `/home/x/proj/src/a.mjs`: equal, or one is a whole-segment suffix of the other.
+function pathsAgree(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.endsWith('/' + b.replace(/^\//, '')) || b.endsWith('/' + a.replace(/^\//, ''));
+}
+
 function normPath(p) {
   let s = String(p).trim().replace(/^["']|["']$/g, '').replace(/\\/g, '/');
   if (!s) return '';
@@ -188,8 +195,9 @@ function normPath(p) {
   return s.length > 1 ? s.replace(/\/+$/, '') : s;
 }
 
-// Leading command: skip `cd x &&` style prefixes and env assignments, then take the
-// program (basename) plus its first non-flag argument, e.g. "git status", "cat src/a.mjs".
+// Legacy reduction: program (basename) plus its first non-flag argument, e.g. "git status".
+// It is only the fallback for a truth command with no extractable path (see commandSignature),
+// because it collapses `python3 -c "<script>"` to "python3 import" and cannot tell two scripts apart.
 function normCommand(cmd) {
   const segments = String(cmd).split(/&&|\|\||;|\|/).map((s) => s.trim()).filter(Boolean);
   const seg = segments.find((s) => !/^cd(\s|$)/.test(s)) ?? segments[0] ?? '';
@@ -201,13 +209,130 @@ function normCommand(cmd) {
   return arg ? `${program} ${normPath(arg)}` : program;
 }
 
+// ---- Bash signatures
+// A shell command is compared by what it runs and what it touches, not by how a script is
+// written: { program, module, paths }. A differently written inline script against the same
+// files is the same next action.
+
+// Split a command into chain segments on && || ; | and newlines, but only outside quotes, so
+// the `;` in `python3 -c "import re; ..."` stays inside its segment.
+function splitChain(cmd) {
+  const segs = [];
+  let cur = '', quote = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      cur += c;
+      if (c === '\\' && quote === '"' && i + 1 < cmd.length) cur += cmd[++i];
+      else if (c === quote) quote = null;
+    } else if (c === '\\' && i + 1 < cmd.length) { cur += c + cmd[++i]; }
+    else if (c === '"' || c === "'") { quote = c; cur += c; }
+    else if (c === ';' || c === '\n' || c === '|' || (c === '&' && cmd[i + 1] === '&')) {
+      if (c === '|' && cmd[i + 1] === '|') i++;
+      else if (c === '&') i++;
+      segs.push(cur); cur = '';
+    } else cur += c;
+  }
+  segs.push(cur);
+  return segs.map((s) => s.trim()).filter(Boolean);
+}
+
+// Whitespace-separated words of one segment with quotes removed and quoted spans kept whole.
+function shellWords(seg) {
+  const words = [];
+  let cur = '', has = false, quote = null;
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && quote === '"' && i + 1 < seg.length) cur += seg[++i];
+      else cur += c;
+    } else if (c === '"' || c === "'") { quote = c; has = true; }
+    else if (c === '\\' && i + 1 < seg.length) { cur += seg[++i]; has = true; }
+    else if (/\s/.test(c)) { if (has) words.push(cur); cur = ''; has = false; }
+    else { cur += c; has = true; }
+  }
+  if (has) words.push(cur);
+  return words;
+}
+
+// Extensions that make a slash-less token a file. An allowlist, because `re.sub`, `os.path` and
+// `conn.execute` in an inline script all look like "name.ext" to a generic rule.
+const FILE_EXT = new Set(('md txt json jsonl py pyi mjs cjs js jsx ts tsx sh bash zsh db sqlite sqlite3 csv tsv yaml yml toml ini cfg conf ' +
+  'html htm css xml sql log lock bin slog service env pdf png jpg jpeg gif svg zip gz tgz tar rs go c h cpp hpp java rb php ipynb ' +
+  'proto rst tex diff patch').split(' '));
+const PATH_CHARS = /^[\p{L}\p{N}_.~@%+*/-]+$/u;
+
+// Every path-like token anywhere in the text, including inside quoted script bodies: normalised,
+// sorted, and de-duplicated, where spellings of one file that agree (`data/a.json` and
+// `/home/x/data/a.json`) count as one and the longest is kept. A path contains `/` or has a known file extension; flags, URLs,
+// /dev/null and bare numbers are not paths.
+function extractPaths(text) {
+  const out = new Set();
+  for (const raw of text.split(/[\s'"`()[\]{},;=|&]+/)) {
+    let t = raw.replace(/^\d*(?:>>?|<)&?/, '').replace(/^\\+|\\+$/g, '').replace(/[.!?:]+$/, '');
+    if (!t || t.startsWith('-') || /^[a-z][a-z0-9+.-]*:\/\//i.test(t) || !PATH_CHARS.test(t)) continue;
+    const named = t.includes('/')
+      ? /[\p{L}\p{N}]/u.test(t) && !/^\d+(?:\/\d+)+$/.test(t)
+      : FILE_EXT.has(t.slice(t.lastIndexOf('.') + 1).toLowerCase()) && t.lastIndexOf('.') > 0;
+    if (!named) continue;
+    const p = normPath(t);
+    if (p && p !== '.' && p !== '/' && p !== '/dev/null') out.add(p);
+  }
+  const kept = [];
+  for (const p of [...out].sort((a, b) => b.length - a.length || (a < b ? -1 : 1))) if (!kept.some((q) => pathsAgree(p, q))) kept.push(p);
+  return kept.sort();
+}
+
+// { program, module, paths } of a shell command. The program is the first token of the first
+// chain segment that is not `cd` or a bare env assignment (leading FOO=1 is skipped);
+// `python3 -m mod` gives module `mod`. Paths come from that segment onward, so a leading
+// `cd /work &&` does not become part of the target.
+export function commandSignature(cmd) {
+  const segs = splitChain(String(cmd));
+  const wordsOf = (s) => { const w = shellWords(s); while (w.length && /^\w+=/.test(w[0])) w.shift(); return w; };
+  let from = segs.findIndex((s) => { const w = wordsOf(s); return w.length && w[0] !== 'cd'; });
+  if (from < 0) from = 0;
+  const words = wordsOf(segs[from] ?? '');
+  const program = (words[0] ?? '').split('/').pop();
+  const module = /^python[\d.]*$/.test(program) && words[1] === '-m' && words[2] ? words[2] : null;
+  // the program word is what runs, not a target: `/usr/bin/npm run lint` and `npm run lint` agree
+  const rest = segs.slice(from).join('\n').replace(words[0] ?? '', ' ');
+  return { program, module, paths: extractPaths(rest) };
+}
+
+export function signatureString(sig) {
+  return `${sig.program}${sig.module ? ` -m ${sig.module}` : ''} paths=[${sig.paths.join(', ')}]`;
+}
+
+// The Bash target: the signature for comparison and display, plus the legacy string used when
+// the command names no path at all (then `loose` is set and the comparison is weaker evidence).
+function commandTarget(cmd) {
+  const signature = commandSignature(cmd);
+  const legacy = normCommand(cmd);
+  const loose = signature.paths.length === 0;
+  return { kind: 'command', value: loose ? legacy : signatureString(signature), signature, legacy, loose };
+}
+
+// 1.0 same program, module and path set; 0.5 same program but a different module or path set;
+// 0.0 different program. A truth with no paths falls back to the legacy comparison (1.0 equal
+// reduced command, else 0.5). A missing answer target is the same tool, other target: 0.5.
+function commandScore(want, have) {
+  if (!have) return 0.5;
+  if (want.loose) return want.legacy === have.legacy ? 1 : 0.5;
+  const w = want.signature, h = have.signature;
+  if (w.program !== h.program) return 0;
+  const samePaths = w.paths.every((p) => h.paths.some((q) => pathsAgree(p, q))) && h.paths.every((q) => w.paths.some((p) => pathsAgree(p, q)));
+  return w.module === h.module && samePaths ? 1 : 0.5;
+}
+
 // The thing an action points at: { kind, value }, or null when the tool has no target
 // (e.g. TodoWrite). Paths first, then the leading command, then search-style fields.
 export function normaliseTarget(tool, input = {}) {
   for (const k of ['file_path', 'notebook_path']) {
     if (typeof input[k] === 'string' && input[k].trim()) return { kind: 'path', value: normPath(input[k]) };
   }
-  if (typeof input.command === 'string' && input.command.trim()) return { kind: 'command', value: normCommand(input.command) };
+  if (typeof input.command === 'string' && input.command.trim()) return commandTarget(input.command);
   if (typeof input.path === 'string' && input.path.trim()) return { kind: 'path', value: normPath(input.path) };
   for (const k of ['pattern', 'url', 'query', 'description']) {
     if (typeof input[k] === 'string' && input[k].trim()) return { kind: 'other', value: input[k].trim().replace(/\s+/g, ' ') };
@@ -215,14 +340,13 @@ export function normaliseTarget(tool, input = {}) {
   return null;
 }
 
-// Equal after normalisation. Paths also match when one is a whole-segment suffix of the
-// other, so `src/a.mjs` agrees with `/home/x/proj/src/a.mjs`.
+// Equal after normalisation, where paths (and the paths of a command) also match when one is a
+// whole-segment suffix of the other. Commands match on signature.
 export function sameTarget(a, b) {
   if (!a || !b) return a === b;
   if (a.kind !== b.kind) return false;
-  if (a.value === b.value) return true;
-  if (a.kind !== 'path' || !a.value || !b.value) return false;
-  return a.value.endsWith('/' + b.value.replace(/^\//, '')) || b.value.endsWith('/' + a.value.replace(/^\//, ''));
+  if (a.kind === 'command') return commandScore(a, b) === 1;
+  return a.kind === 'path' && pathsAgree(a.value, b.value);
 }
 
 // A TOOL-line target is free text, so it is read the way the real action's target is
@@ -231,16 +355,18 @@ function targetFromText(want, text) {
   if (!text.trim()) return null;
   if (!want) return { kind: 'other', value: text.trim() };
   if (want.kind === 'path') return { kind: 'path', value: normPath(text) };
-  if (want.kind === 'command') return { kind: 'command', value: normCommand(text) };
+  if (want.kind === 'command') return commandTarget(text);
   return { kind: 'other', value: text.trim().replace(/\s+/g, ' ') };
 }
 
 // 1.0 same tool and target, 0.5 same tool other target, 0.0 different tool or no action.
+// Bash targets are graded by commandScore, where a different program is also 0.0.
 export function scoreAction(truth, got) {
   if (!got) return 0;
   if (got.tool !== truth.tool) return 0;
   const want = normaliseTarget(truth.tool, truth.input);
   const have = typeof got.target === 'string' ? targetFromText(want, got.target) : normaliseTarget(got.tool, got.input);
+  if (want?.kind === 'command' && have?.kind === 'command') return commandScore(want, have);
   return sameTarget(want, have) ? 1 : 0.5;
 }
 
@@ -339,9 +465,19 @@ const pct = (x) => `${(100 * x).toFixed(1)}%`;
 
 const clip = (x, n) => (x.length > n ? `${x.slice(0, n - 1)}…` : x);
 
-function describeTruth(truth) {
-  const t = normaliseTarget(truth.tool, truth.input);
-  return t ? `${truth.tool} ${clip(t.value.replace(/\s+/g, ' '), 60)}` : truth.tool;
+// The real action for auditing the scoring: `raw` as the agent took it (clipped, one line),
+// `signature` as it is compared (never clipped), and `loose` when a Bash truth names no path
+// and so falls back to the weaker legacy comparison (flagged `loose_target` in the reports).
+export function describeTruth(truth) {
+  const input = truth.input ?? {};
+  const rawTarget = ['command', 'file_path', 'notebook_path', 'path', 'pattern', 'url', 'query', 'description']
+    .map((k) => input[k]).find((v) => typeof v === 'string' && v.trim()) ?? '';
+  const t = normaliseTarget(truth.tool, input);
+  return {
+    raw: clip(`${truth.tool} ${rawTarget}`.trim().replace(/\s+/g, ' '), 120),
+    signature: t ? (t.kind === 'command' ? t.value : `${t.kind} ${t.value}`) : '(no target)',
+    loose: t?.kind === 'command' && t.loose,
+  };
 }
 
 export function formatPlan(messages, sel, thresholds, plan, opts) {
@@ -354,7 +490,13 @@ export function formatPlan(messages, sel, thresholds, plan, opts) {
     `provider: ${opts.provider}${opts.model ? ` (${opts.model})` : ''}`,
     `prompt style: ${opts.promptStyle ?? DEFAULT_PROMPT_STYLE}, repeats: ${repeats} per condition`,
     `cut points (${sel.cuts.length}):`,
-    ...sel.cuts.map((c) => `  K=${c.index}  prefix ${c.index} messages, ${renderContext(messages.slice(0, c.index)).length} chars  instruction at ${c.instructionIndex} (${c.index - c.instructionIndex} messages back)  truth: ${describeTruth(c.truth)}`),
+    ...sel.cuts.flatMap((c) => {
+      const d = describeTruth(c.truth);
+      return [
+        `  K=${c.index}  prefix ${c.index} messages, ${renderContext(messages.slice(0, c.index)).length} chars  instruction at ${c.instructionIndex} (${c.index - c.instructionIndex} messages back)  truth: ${d.raw}`,
+        `      normalised signature: ${d.signature}${d.loose ? '  [loose_target: no path in the truth command, scored by the weaker fallback]' : ''}`,
+      ];
+    }),
     `conditions per cut: full + compacted at ${thresholds.join(', ')}`,
     `calls: ${plan.modelCalls} model (${sel.cuts.length} cuts x ${plan.conditions} conditions x ${repeats} repeat${repeats === 1 ? '' : 's'}) + >=${plan.jevRequests} Jev = ${plan.total} (max ${plan.maxCalls})` +
       ` (compacted conditions are skipped for cut points where the baseline is not reproduced, so this is an upper bound)`,
@@ -380,6 +522,7 @@ export async function runFidelity({ messages, cuts, thresholds, provider, compac
     const fullText = renderContext(prefix);
     const r = {
       index: cut.index, prefixMessages: prefix.length, instruction: cut.instruction, truth: cut.truth,
+      truthSignature: describeTruth(cut.truth).signature, looseTarget: describeTruth(cut.truth).loose,
       status: 'scored', baseline: { ...(await attempt(provider, promptStyle, fullText, cut.instruction, cut.truth, repeats)), chars: fullText.length }, conditions: [],
     };
     r.status = baselineStatus(r.baseline);
@@ -412,6 +555,7 @@ export function aggregate(results, thresholds) {
       minSample: scores.length ? Math.min(...scores) : null, maxSample: scores.length ? Math.max(...scores) : null,
       exactRate: scores.length ? scores.filter((x) => x === 1).length / scores.length : null,
       unparsed: ok.reduce((a, c) => a + c.unparsed, 0),
+      looseTargets: scored.filter((r) => r.looseTarget && ok.includes(r.conditions.find((c) => c.threshold === t))).length,
       meanSaved: mean(ok.map((c) => c.saved)),
     };
   });
@@ -427,8 +571,8 @@ const f2 = (x) => (x === null ? 'n/a' : x.toFixed(2));
 const cell = (c) => (c.score === null ? 'err' :
   `${f2(c.score)} [${f2(c.min)}-${f2(c.max)}] n=${c.n}${c.unparsed ? ` u${c.unparsed}` : ''}${c.errors ? ` e${c.errors}` : ''}`);
 
-// Contains no session text (no instructions, tool targets or model answers), only counts
-// and scores; the raw material lives in the gitignored json.
+// Holds session text: the truth-action section quotes the real commands and paths so the
+// scoring can be audited. Like the json it is gitignored; do not publish it as is.
 export function buildMarkdown(meta, results, thresholds) {
   const agg = aggregate(results, thresholds);
   const scored = results.filter((r) => r.status === 'scored');
@@ -449,10 +593,11 @@ export function buildMarkdown(meta, results, thresholds) {
     `Over the ${scored.length} cut points where the full-context baseline reproduced the real action.`,
     '',
     'n = cut points, samples = scored model answers behind them. Min and max are over single samples.',
+    `loose_target = how many of the n cut points have a Bash truth command with no path in it, scored by the weaker fallback (same reduced command 1.0, else 0.5). The more of n that are loose, the less of the mean rests on a signature comparison.`,
     '',
-    '| threshold | n | samples | mean agreement | min | max | exact match (of samples) | unparsed | errors | mean context saved |',
-    '|---|---|---|---|---|---|---|---|---|---|',
-    ...agg.map((a) => `| ${a.threshold.toFixed(2)} | ${a.n} | ${a.samples} | ${f2(a.meanAgreement)} | ${f2(a.minSample)} | ${f2(a.maxSample)} | ${a.exactRate === null ? 'n/a' : pct(a.exactRate)} | ${a.unparsed} | ${a.errors} | ${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)} |`),
+    '| threshold | n | loose_target | samples | mean agreement | min | max | exact match (of samples) | unparsed | errors | mean context saved |',
+    '|---|---|---|---|---|---|---|---|---|---|---|',
+    ...agg.map((a) => `| ${a.threshold.toFixed(2)} | ${a.n} | ${a.looseTargets} | ${a.samples} | ${f2(a.meanAgreement)} | ${f2(a.minSample)} | ${f2(a.maxSample)} | ${a.exactRate === null ? 'n/a' : pct(a.exactRate)} | ${a.unparsed} | ${a.errors} | ${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)} |`),
     '',
     '## Baseline and exclusions',
     '',
@@ -462,6 +607,18 @@ export function buildMarkdown(meta, results, thresholds) {
     `- baseline_error: ${baseErr.length}. Failed baseline model calls left the verdict undecided.`,
     `- compaction_error: ${compErr.length}. The baseline matched but compaction failed.`,
     `- Cut points never selected: ${meta.candidates - results.length} of ${meta.candidates} candidates (${meta.noInstruction ?? 0} no_instruction, ${meta.tooEarly} prefix too short to compact, ${meta.tooLarge ?? 0} too_large for \`--max-prefix-chars\`, the rest beyond \`--cuts\`).`,
+    '',
+    '## Truth actions and how they were scored',
+    '',
+    'The real action at each cut point, and the signature it was compared by. Bash: `program [-m module] paths=[...]`; other tools: `kind target`. `loose_target` = a Bash truth with no extractable path.',
+    '',
+    '| K | status | truth action | normalised signature | flag |',
+    '|---|---|---|---|---|',
+    ...results.map((r) => {
+      const d = describeTruth(r.truth);
+      const c = (x) => `\`${x.replace(/`/g, "'").replace(/\|/g, '\\|')}\``;
+      return `| ${r.index} | ${r.status} | ${c(d.raw)} | ${c(r.truthSignature ?? d.signature)} | ${(r.looseTarget ?? d.loose) ? 'loose_target' : ''} |`;
+    }),
     '',
     '## Per cut point',
     '',
@@ -480,6 +637,7 @@ export function buildMarkdown(meta, results, thresholds) {
     '## How to read this',
     '',
     '- Agreement: 1.0 same tool and target, 0.5 same tool other target, 0.0 different tool or unparsable answer. Deterministic, no judge.',
+    '- Bash targets are compared by signature: same program, module and path set 1.0 (so a rewritten inline script against the same files matches), same program but another path set or module 0.5, different program 0.0. A truth with no path (`loose_target`) is compared by program plus first argument instead: equal 1.0, else 0.5.',
     `- A baseline counts as reproduced when at least ${need} of ${repeats} repeats scored exactly 1.0; cut points where it did not are excluded. The table shows the loss relative to a baseline that worked, not absolute accuracy. Repeats that missed on a kept cut point still show in its baseline cell.`,
     '- Every threshold at a cut point is judged on one shared Jev pass, so thresholds are comparable with each other. Jev has run to run variance (see FINDINGS.md), so a fresh run can differ.',
     `- ${repeats === 1 ? 'One model sample per condition, so model nondeterminism is not visible at all' : `${repeats} model samples per condition, so the min and max show how much the model varies on its own`}. Treat differences between neighbouring thresholds smaller than that spread as noise.`,
@@ -557,7 +715,7 @@ export async function main(argv, deps = {}) {
   writeFileSync(`${o.out}-fidelity.json`, JSON.stringify(buildJson(meta, results, o.thresholds), null, 2));
   writeFileSync(`${o.out}-fidelity.md`, buildMarkdown(meta, results, o.thresholds));
   log(`wrote ${o.out}-fidelity.json and ${o.out}-fidelity.md (${meta.modelCalls} model calls, ${meta.jevRequests} Jev requests)`);
-  for (const a of aggregate(results, o.thresholds)) log(`  t=${a.threshold.toFixed(2)}  n=${a.n}  agreement=${f2(a.meanAgreement)}  saved=${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)}`);
+  for (const a of aggregate(results, o.thresholds)) log(`  t=${a.threshold.toFixed(2)}  n=${a.n}  loose_target=${a.looseTargets}  agreement=${f2(a.meanAgreement)}  saved=${a.meanSaved === null ? 'n/a' : pct(a.meanSaved)}`);
   return 0;
 }
 

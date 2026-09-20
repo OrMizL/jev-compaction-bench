@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   selectCutPoints, renderContext, normaliseTarget, sameTarget, scoreAction, parseAction,
-  runFidelity, aggregate, buildMarkdown, fakeCompactor, main, planFor,
+  runFidelity, aggregate, buildMarkdown, fakeCompactor, main, planFor, commandSignature, describeTruth,
   buildPrompt, parseToolLine, parseAnswer, baselineStatus, formatPlan,
 } from '../fidelity.mjs';
 import { fakeProvider } from '../providers.mjs';
@@ -123,14 +123,99 @@ test('paths normalise and relative paths match absolute ones', () => {
   assert.ok(!sameTarget(normaliseTarget('Read', { file_path: 'b.mjs' }), normaliseTarget('Read', { file_path: 'ab.mjs' })));
 });
 
-test('commands reduce to program plus first non-flag argument', () => {
-  const t = (command) => normaliseTarget('Bash', { command }).value;
-  assert.equal(t('git status'), 'git status');
-  assert.equal(t('  git   status  --short '), 'git status');
-  assert.equal(t('cd /work/todo && node --test test/'), 'node test');
-  assert.equal(t('FOO=1 /usr/bin/npm run lint | tail -5'), 'npm run');
-  assert.equal(t('cat "src/a.mjs"'), 'cat src/a.mjs');
-  assert.notEqual(t('cat src/a.mjs'), t('cat src/b.mjs'));
+// Bash targets are compared by signature { program, module, paths }, not by the old
+// "program plus first non-flag argument" string, which turned every `python3 -c` into "python3 import".
+const bashScore = (truth, answer) => scoreAction({ tool: 'Bash', input: { command: truth } }, { tool: 'Bash', input: { command: answer } });
+
+test('commands resolve to a program, an optional module and a sorted path set', () => {
+  const sig = (c) => commandSignature(c);
+  assert.deepEqual(sig('cat "src/a.mjs"'), { program: 'cat', module: null, paths: ['src/a.mjs'] });
+  assert.deepEqual(sig('  git   status  --short '), { program: 'git', module: null, paths: [] });
+  assert.deepEqual(sig('python3 -m unittest tests/test_store.py -v'), { program: 'python3', module: 'unittest', paths: ['tests/test_store.py'] });
+  assert.deepEqual(sig('python3 -m collector.collect --once'), { program: 'python3', module: 'collector.collect', paths: [] });
+  // chains: cd and env assignments are skipped when finding the program, and cd's directory is not a target
+  assert.deepEqual(sig('cd /work/todo && node --test test/'), { program: 'node', module: null, paths: ['test'] });
+  assert.deepEqual(sig('cd /work; FOO=1; ls -la src/'), { program: 'ls', module: null, paths: ['src'] });
+  assert.deepEqual(sig('FOO=1 /usr/bin/npm run lint | tail -5'), { program: 'npm', module: null, paths: [] }); // the program's own path is not a target
+  // paths: quotes and trailing punctuation stripped; flags, URLs, /dev/null, numbers and code-like dotted names are not paths
+  assert.deepEqual(sig('cp "./a.md", b/c.json 2>/dev/null').paths, ['a.md', 'b/c.json']);
+  assert.deepEqual(sig('curl -o out.bin https://example.com/a/b.json --data=x/y').paths, ['out.bin', 'x/y']);
+  assert.deepEqual(sig('python3 -c "import re, os; print(re.sub(a, b, os.path.join(x, 1/2)))"').paths, []);
+  assert.deepEqual(sig('cat b.md a.md b.md').paths, ['a.md', 'b.md']); // sorted and de-duplicated
+  assert.deepEqual(sig('cat data/a.json /h/data/a.json a.json').paths, ['/h/data/a.json']); // one file spelled three ways
+  // paths inside a quoted script body count, and `;` inside quotes does not split the chain
+  assert.deepEqual(sig("python3 -c \"import re; t = open('/v/notes/Setup.md').read()\""), { program: 'python3', module: null, paths: ['/v/notes/Setup.md'] });
+});
+
+test('a rewritten inline script against the same file scores 1.0; another file 0.5; another program 0.0', () => {
+  const truth = `python3 -c "\nimport re\n\ndef sections(text):\n    return re.findall(r'^##', text)\n\nsetup = open('/v/coffee/Espresso-Setup.md').read()\nprint(sections(setup))"`;
+  const rewritten = `python3 -c "import re; print(len(re.findall('Bean', open('/v/coffee/Espresso-Setup.md').read())))"`;
+  assert.equal(bashScore(truth, rewritten), 1);
+  assert.equal(bashScore(truth, truth), 1);
+  assert.equal(bashScore(truth, `python3 -c "print(open('/v/coffee/Antigua-Dialing-Plan.md').read())"`), 0.5);
+  assert.equal(bashScore(truth, `python3 -c "print(1)"`), 0.5); // same program, no path
+  assert.equal(bashScore(truth, `cat /v/coffee/Espresso-Setup.md`), 0);
+  assert.equal(scoreAction({ tool: 'Bash', input: { command: truth } }, { tool: 'Read', input: { file_path: '/v/coffee/Espresso-Setup.md' } }), 0);
+  // the same paths under a different -m module are not the same action
+  assert.equal(bashScore('python3 -m unittest tests/a.py', 'python3 -m unittest tests/a.py -v'), 1);
+  assert.equal(bashScore('python3 -m unittest tests/a.py', 'python3 -m pytest tests/a.py'), 0.5);
+  // relative and absolute spellings of a path agree, as they do for Read and Edit
+  assert.equal(bashScore('cat /h/proj/data/status.json', 'cat data/status.json'), 1);
+  assert.equal(bashScore('cat /h/proj/data/status.json', 'cat other/status.json'), 0.5);
+  // a leading cd in the truth does not have to be repeated, and a relative path matches only if written the same way
+  assert.equal(bashScore('cd /work && node --test test/', 'node --test test/'), 1);
+  assert.equal(bashScore('cd /work && node --test test/', 'node --test tests/'), 0.5);
+});
+
+test('a truth command with no path is flagged loose_target and scores by the fallback rule', () => {
+  const d = (command) => describeTruth({ tool: 'Bash', input: { command } });
+  assert.equal(d('git status').loose, true);
+  assert.equal(d('python3 -c "print(1)"').loose, true);
+  assert.equal(d('python3 -c "print(open(\'a.md\').read())"').loose, false);
+  assert.equal(describeTruth({ tool: 'Read', input: { file_path: '/p/a.mjs' } }).loose, false);
+  // fallback = the old reduction: equal program + first argument 1.0, otherwise 0.5, even for another program
+  assert.equal(bashScore('git status', 'git status --short'), 1);
+  assert.equal(bashScore('git status', 'git diff'), 0.5);
+  assert.equal(bashScore('git status', 'ls src/'), 0.5);
+  assert.equal(scoreAction({ tool: 'Bash', input: { command: 'git status' } }, { tool: 'Edit', input: { file_path: 'a' } }), 0);
+});
+
+test('the dry run prints the raw truth and its normalised signature, and flags loose targets', () => {
+  const msgs = [{ role: 'user', text: 'go', toolUses: [] }];
+  const cmds = ["python3 -c \"import re; open('/v/a.md').read()\"", 'git status'];
+  cmds.forEach((command, i) => {
+    msgs.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `t${i}`, tool: 'Bash', input: { command } }] });
+    msgs.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `t${i}`, text: 'ok' }] });
+  });
+  const sel = selectCutPoints(msgs, { cuts: 9, minPrefix: 0 });
+  const plan = formatPlan(msgs, sel, [0.2], planFor({ cuts: sel.cuts, thresholds: [0.2], maxCalls: 60 }), { provider: 'fake' });
+  assert.match(plan, /truth: Bash python3 -c "import re; open\('\/v\/a\.md'\)\.read\(\)"/);
+  assert.match(plan, /normalised signature: python3 paths=\[\/v\/a\.md\]\n/);
+  assert.match(plan, /normalised signature: git status  \[loose_target/);
+});
+
+test('reports show each truth signature and count loose_target cut points per threshold', async () => {
+  const cmds = ['ls src/', 'git status', 'pwd', 'cat src/x.md', 'ls', 'echo hi', 'echo a', 'echo b', 'echo c', 'echo d'];
+  const msgs = [{ role: 'user', text: 'go', toolUses: [] }];
+  cmds.forEach((command, i) => {
+    msgs.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `t${i}`, tool: 'Bash', input: { command } }] });
+    msgs.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `t${i}`, text: 'ok' }] });
+  });
+  const { cuts } = selectCutPoints(msgs, { cuts: 4, minPrefix: 0 });
+  const provider = fakeProvider((_s, context) => {
+    const n = (context.match(/\[assistant tool_use Bash\]/g) ?? []).length;
+    return JSON.stringify({ tool: 'Bash', input: { command: cmds[n] } }); // the real next action
+  });
+  const results = await runFidelity({ messages: msgs, cuts, thresholds: [0.2, 0.5], provider, compactor: fakeCompactor() });
+  assert.deepEqual(results.map((r) => r.looseTarget), cuts.map((c) => !/[/.]/.test(cmds[(c.index - 1) / 2])));
+  const loose = results.filter((r) => r.looseTarget).length;
+  assert.ok(loose > 0 && loose < results.length);
+  for (const a of aggregate(results, [0.2, 0.5])) assert.equal(a.looseTargets, loose);
+  const md = buildMarkdown({ date: 'd', provider: 'fake', modelCalls: 0, jevRequests: 0, candidates: 4, tooEarly: 0 }, results, [0.2, 0.5]);
+  assert.match(md, /\| threshold \| n \| loose_target \|/);
+  assert.match(md, /## Truth actions and how they were scored/);
+  assert.match(md, /`Bash git status` \| `git status` \| loose_target \|/);
+  assert.match(md, /`Bash cat src\/x\.md` \| `cat paths=\[src\/x\.md\]` \|  \|/);
 });
 
 test('tools without a target only match each other', () => {
@@ -347,7 +432,8 @@ test('situation answers in TOOL <name> <target> form are parsed and scored', () 
   assert.equal(scoreAction(read, parseToolLine('TOOL Read')), 0.5);
   assert.equal(scoreAction(read, parseToolLine('TOOL Edit src/a.mjs')), 0);
   assert.equal(scoreAction(bash, parseToolLine('TOOL Bash node --test test/')), 1);
-  assert.equal(scoreAction(bash, parseToolLine('TOOL Bash git status')), 0.5);
+  assert.equal(scoreAction(bash, parseToolLine('TOOL Bash git status')), 0); // the truth names a path, so another program is 0.0
+  assert.equal(scoreAction(bash, parseToolLine('TOOL Bash node --test tests/')), 0.5);
   assert.equal(scoreAction({ tool: 'TodoWrite', input: { todos: [] } }, parseToolLine('TOOL TodoWrite')), 1);
 });
 
