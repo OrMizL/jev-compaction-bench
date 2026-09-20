@@ -1,11 +1,12 @@
 // Context-ablation fidelity eval: does pruning context cost the agent its ability to continue?
-// Method (rewind-and-continue): pick points in a real session where the user gave an
-// instruction and the agent answered with a tool call. Replay each point with the full
-// prefix (baseline) and with the prefix compacted at each threshold, ask a model for the
+// Method (rewind-and-continue): pick points in a real session where the agent acted, i.e.
+// an assistant message with a tool call. Replay each point with the full prefix before
+// that message (baseline) and with the prefix compacted at each threshold, ask a model for the
 // single next action, and score it against what the agent really did. No LLM judge.
 //
 // Usage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME]
-//          [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N] [--dry-run]
+//          [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N]
+//          [--max-prefix-chars N] [--dry-run]
 // Compaction is live, so TYPESAFE_API_KEY and JEV_LIB are needed exactly as for run.mjs
 // (not for --dry-run or --provider fake).
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -19,6 +20,9 @@ export const DEFAULT_MAX_CALLS = 60;
 // The library pins the first message and the newest 6, so a prefix shorter than this has
 // nothing compactable and every threshold would trivially save 0%.
 export const MIN_PREFIX = 8;
+// Rendered-prefix ceiling per condition. Bigger prefixes are skipped and reported, never
+// truncated: truncation would change what is being tested.
+export const MAX_PREFIX_CHARS = 80000;
 const PRESERVE_RECENT = 6;
 const TRUNCATE_HEAD = 300;
 
@@ -41,27 +45,37 @@ function isInstruction(m) {
     !NOT_AN_INSTRUCTION.test(m.text);
 }
 
-// A cut point K is a genuine user instruction with an assistant tool call within the next
-// 3 messages. Returns { cuts, candidates, tooEarly }: the chosen cut points (spread evenly
-// across the candidates), how many candidates existed, and how many were dropped for
-// having a prefix too short to compact.
-export function selectCutPoints(messages, { cuts = DEFAULT_CUTS, minPrefix = MIN_PREFIX } = {}) {
-  const found = [];
-  messages.forEach((m, k) => {
-    if (!isInstruction(m)) return;
-    for (let j = k + 1; j <= k + 3 && j < messages.length; j++) {
-      const a = messages[j];
-      if (a.role === 'assistant' && a.toolUses?.length) {
-        found.push({ index: k, actionIndex: j, instruction: m.text, truth: { tool: a.toolUses[0].tool, input: a.toolUses[0].input ?? {} } });
-        return;
+// A cut point K is an assistant message with a tool call, so the prefix under test is
+// messages[0..K) and the acting message stays out of it. Real Claude Code sessions are
+// mostly tool-result carriers with the prose on assistant turns, so anchoring on the
+// action rather than on an instruction message is what finds cut points in them. The
+// instruction sent with the prompt is the newest genuine user instruction before K.
+// Returns { cuts, candidates, tooEarly, noInstruction, tooLarge }: the chosen cut points
+// (spread evenly across the usable candidates), the number of acting messages, and how
+// many were dropped for each reason.
+export function selectCutPoints(messages, { cuts = DEFAULT_CUTS, minPrefix = MIN_PREFIX, maxPrefixChars = MAX_PREFIX_CHARS } = {}) {
+  const usable = [];
+  let candidates = 0, noInstruction = 0, tooEarly = 0, tooLarge = 0;
+  let instructionIndex = -1; // newest instruction strictly before k
+  messages.forEach((a, k) => {
+    if (a.role === 'assistant' && a.toolUses?.length) {
+      candidates++;
+      if (instructionIndex < 0) noInstruction++;
+      else if (k < minPrefix) tooEarly++;
+      else if (renderContext(messages.slice(0, k)).length > maxPrefixChars) tooLarge++;
+      else {
+        usable.push({
+          index: k, instructionIndex, instruction: messages[instructionIndex].text,
+          truth: { tool: a.toolUses[0].tool, input: a.toolUses[0].input ?? {} },
+        });
       }
     }
+    if (isInstruction(a)) instructionIndex = k;
   });
-  const usable = found.filter((c) => c.index >= minPrefix);
   const chosen = [];
   if (usable.length <= cuts) chosen.push(...usable);
   else for (let i = 0; i < cuts; i++) chosen.push(usable[Math.floor(((i + 0.5) * usable.length) / cuts)]);
-  return { cuts: chosen, candidates: found.length, tooEarly: found.length - usable.length };
+  return { cuts: chosen, candidates, tooEarly, noInstruction, tooLarge };
 }
 
 // ---------------------------------------------------------------- rendering
@@ -233,12 +247,22 @@ export function planFor({ cuts, thresholds, maxCalls }) {
 
 const pct = (x) => `${(100 * x).toFixed(1)}%`;
 
+const clip = (x, n) => (x.length > n ? `${x.slice(0, n - 1)}…` : x);
+
+function describeTruth(truth) {
+  const t = normaliseTarget(truth.tool, truth.input);
+  return t ? `${truth.tool} ${clip(t.value, 60)}` : truth.tool;
+}
+
 export function formatPlan(messages, sel, thresholds, plan, opts) {
+  const maxPrefixChars = opts.maxPrefixChars ?? MAX_PREFIX_CHARS;
   const lines = [
-    `transcript: ${messages.length} messages; ${sel.candidates} cut point candidates, ${sel.tooEarly} dropped for a prefix under ${MIN_PREFIX} messages`,
+    `transcript: ${messages.length} messages; ${sel.candidates} acting messages (assistant tool calls) as cut point candidates`,
+    `skipped: ${sel.noInstruction} no_instruction (no user instruction before it), ${sel.tooEarly} prefix under ${MIN_PREFIX} messages, ` +
+      `${sel.tooLarge} too_large (rendered prefix over --max-prefix-chars ${maxPrefixChars})`,
     `provider: ${opts.provider}${opts.model ? ` (${opts.model})` : ''}`,
     `cut points (${sel.cuts.length}):`,
-    ...sel.cuts.map((c) => `  K=${c.index}  prefix ${c.index} messages, ${renderContext(messages.slice(0, c.index)).length} chars  truth: ${c.truth.tool}`),
+    ...sel.cuts.map((c) => `  K=${c.index}  prefix ${c.index} messages, ${renderContext(messages.slice(0, c.index)).length} chars  instruction at ${c.instructionIndex}  truth: ${describeTruth(c.truth)}`),
     `conditions per cut: full + compacted at ${thresholds.join(', ')}`,
     `calls: ${plan.modelCalls} model + >=${plan.jevRequests} Jev = ${plan.total} (max ${plan.maxCalls})` +
       ` (compacted conditions are skipped for cut points where the baseline misses, so this is an upper bound)`,
@@ -324,7 +348,7 @@ export function buildMarkdown(meta, results, thresholds) {
     `- baseline_miss: ${missed.length}. The full context did not reproduce the real action (same tool and same target), so the cut point says nothing about compaction. Compacted conditions were not run for these.`,
     `- baseline_error: ${baseErr.length}. The model call for the baseline failed.`,
     `- compaction_error: ${compErr.length}. The baseline matched but compaction failed.`,
-    `- Cut points never selected: ${meta.candidates - results.length} of ${meta.candidates} candidates (${meta.tooEarly} had a prefix too short to compact, the rest were beyond \`--cuts\`).`,
+    `- Cut points never selected: ${meta.candidates - results.length} of ${meta.candidates} candidates (${meta.noInstruction ?? 0} no_instruction, ${meta.tooEarly} prefix too short to compact, ${meta.tooLarge ?? 0} too_large for \`--max-prefix-chars\`, the rest beyond \`--cuts\`).`,
     '',
     '## Per cut point',
     '',
@@ -358,7 +382,7 @@ export function buildMarkdown(meta, results, thresholds) {
 // ---------------------------------------------------------------- cli
 
 export function parseArgs(argv) {
-  const o = { cuts: DEFAULT_CUTS, thresholds: DEFAULT_THRESHOLDS, provider: 'claude', maxCalls: DEFAULT_MAX_CALLS, dryRun: false };
+  const o = { cuts: DEFAULT_CUTS, thresholds: DEFAULT_THRESHOLDS, provider: 'claude', maxCalls: DEFAULT_MAX_CALLS, maxPrefixChars: MAX_PREFIX_CHARS, dryRun: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -369,6 +393,7 @@ export function parseArgs(argv) {
     else if (a === '--provider') o.provider = val();
     else if (a === '--out') o.out = val();
     else if (a === '--max-calls') o.maxCalls = Number(val());
+    else if (a === '--max-prefix-chars') o.maxPrefixChars = Number(val());
     else if (a === '--dry-run') o.dryRun = true;
     else if (a.startsWith('--')) throw new Error(`unknown option ${a}`);
     else rest.push(a);
@@ -377,6 +402,7 @@ export function parseArgs(argv) {
   o.input = rest[0];
   if (!Number.isInteger(o.cuts) || o.cuts < 1) throw new Error('--cuts must be a positive integer');
   if (!Number.isInteger(o.maxCalls) || o.maxCalls < 1) throw new Error('--max-calls must be a positive integer');
+  if (!Number.isInteger(o.maxPrefixChars) || o.maxPrefixChars < 1) throw new Error('--max-prefix-chars must be a positive integer');
   if (!o.thresholds.length || o.thresholds.some((t) => !Number.isFinite(t) || t < 0 || t > 1)) throw new Error('--thresholds must be numbers between 0 and 1');
   if (!['claude', 'openrouter', 'fake'].includes(o.provider)) throw new Error(`unknown provider "${o.provider}" (expected claude, openrouter or fake)`);
   return o;
@@ -387,13 +413,13 @@ export async function main(argv, deps = {}) {
   const log = deps.log ?? console.log;
   let o;
   try { o = parseArgs(argv); } catch (e) {
-    console.error(`${e.message}\nusage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME] [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N] [--dry-run]`);
+    console.error(`${e.message}\nusage: node fidelity.mjs <messages.json> [--cuts N] [--thresholds LIST] [--model NAME] [--provider claude|openrouter|fake] [--out PREFIX] [--max-calls N] [--max-prefix-chars N] [--dry-run]`);
     return 2;
   }
   const messages = JSON.parse(readFileSync(o.input, 'utf8'));
   if (!Array.isArray(messages)) { console.error('input is not a Message[] (run adapt.mjs first)'); return 2; }
 
-  const sel = selectCutPoints(messages, { cuts: o.cuts });
+  const sel = selectCutPoints(messages, { cuts: o.cuts, maxPrefixChars: o.maxPrefixChars });
   const plan = planFor({ cuts: sel.cuts, thresholds: o.thresholds, maxCalls: o.maxCalls });
   log(formatPlan(messages, sel, o.thresholds, plan, o));
   if (!sel.cuts.length) { console.error('no usable cut points in this transcript'); return 1; }
@@ -410,7 +436,8 @@ export async function main(argv, deps = {}) {
   const results = await runFidelity({ messages, cuts: sel.cuts, thresholds: o.thresholds, provider, compactor });
   const meta = {
     date: new Date().toISOString(), provider: provider.name, model: o.model ?? null, input: o.input,
-    candidates: sel.candidates, tooEarly: sel.tooEarly, modelCalls: provider.calls, jevRequests: compactor.jevRequests,
+    candidates: sel.candidates, tooEarly: sel.tooEarly, noInstruction: sel.noInstruction, tooLarge: sel.tooLarge,
+    maxPrefixChars: o.maxPrefixChars, modelCalls: provider.calls, jevRequests: compactor.jevRequests,
   };
   writeFileSync(`${o.out}-fidelity.json`, JSON.stringify(buildJson(meta, results, o.thresholds), null, 2));
   writeFileSync(`${o.out}-fidelity.md`, buildMarkdown(meta, results, o.thresholds));

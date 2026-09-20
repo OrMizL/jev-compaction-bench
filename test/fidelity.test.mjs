@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  selectCutPoints, normaliseTarget, sameTarget, scoreAction, parseAction,
+  selectCutPoints, renderContext, normaliseTarget, sameTarget, scoreAction, parseAction,
   runFidelity, aggregate, buildMarkdown, fakeCompactor, main, planFor,
 } from '../fidelity.mjs';
 import { fakeProvider } from '../providers.mjs';
@@ -16,36 +16,86 @@ const messages = JSON.parse(readFileSync(FIXTURE, 'utf8'));
 
 // ---- cut-point selection
 
-test('cut points are real user instructions followed by an assistant tool call', () => {
-  const { cuts, candidates, tooEarly } = selectCutPoints(messages, { cuts: 99 });
-  assert.equal(candidates, 6);
-  assert.equal(tooEarly, 1); // K=0 has no prefix worth compacting
-  assert.deepEqual(cuts.map((c) => c.index), [9, 18, 23, 27, 32]);
+test('cut points are assistant tool calls after an instruction, and the prefix excludes the action', () => {
+  const { cuts, candidates, tooEarly, noInstruction, tooLarge } = selectCutPoints(messages, { cuts: 99 });
+  assert.equal(candidates, 14); // every assistant message with a tool call
+  assert.equal(noInstruction, 0);
+  assert.equal(tooEarly, 4); // the acts at K=1, 3, 5, 7 have prefixes under 8 messages
+  assert.equal(tooLarge, 0);
+  assert.deepEqual(cuts.map((c) => c.index), [10, 12, 14, 16, 19, 21, 24, 28, 30, 33]);
   for (const c of cuts) {
-    assert.equal(messages[c.index].role, 'user');
-    assert.ok(messages[c.index].text.length > 0);
-    assert.equal(c.truth.tool, messages[c.actionIndex].toolUses[0].tool);
+    assert.equal(messages[c.index].role, 'assistant');
+    assert.equal(c.truth.tool, messages[c.index].toolUses[0].tool);
+    assert.ok(c.instructionIndex < c.index);
+    assert.equal(c.instruction, messages[c.instructionIndex].text);
   }
   assert.equal(cuts[0].truth.tool, 'Write');
+  assert.equal(cuts[0].instructionIndex, 9); // the newest instruction, not the first one
 });
 
-test('tool results and injected user text are not cut points', () => {
+test('injected user text and tool results are never the instruction', () => {
   const msgs = [
-    { role: 'user', text: '<local-command-stdout>x</local-command-stdout>', toolUses: [] },
-    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'a', tool: 'Bash', input: { command: 'ls' } }] },
-    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'a', text: 'ok' }] },
     { role: 'user', text: 'real instruction', toolUses: [] },
-    { role: 'assistant', text: 'no tool here', toolUses: [] },
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'a', tool: 'Bash', input: { command: 'ls' } }] },
+    { role: 'user', text: '<local-command-stdout>x</local-command-stdout>', toolUses: [] },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'a', text: 'ok' }] },
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'pwd' } }] },
   ];
-  assert.equal(selectCutPoints(msgs, { minPrefix: 0 }).cuts.length, 0);
+  const { cuts } = selectCutPoints(msgs, { minPrefix: 0 });
+  assert.deepEqual(cuts.map((c) => [c.index, c.instructionIndex, c.instruction]), [[1, 0, 'real instruction'], [4, 0, 'real instruction']]);
 });
 
-test('an action more than 3 messages after the instruction does not count', () => {
-  const idle = { role: 'assistant', text: 'thinking', toolUses: [] };
-  const act = { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'a', tool: 'Bash', input: { command: 'ls' } }] };
-  const u = { role: 'user', text: 'do it', toolUses: [] };
-  assert.equal(selectCutPoints([u, idle, idle, act], { minPrefix: 0 }).cuts.length, 1); // action at +3
-  assert.equal(selectCutPoints([u, idle, idle, idle, act], { minPrefix: 0 }).cuts.length, 0); // at +4
+// Shaped like a real Claude Code session: one prompt, then user messages that only carry
+// tool results, with the prose on assistant messages.
+function realShaped() {
+  const msgs = [{ role: 'user', text: 'fix the flaky parser test', toolUses: [] }];
+  for (let i = 0; i < 14; i++) {
+    msgs.push({ role: 'assistant', text: `step ${i}`, toolUses: [{ tool_use_id: `t${i}`, tool: i % 2 ? 'Read' : 'Bash', input: i % 2 ? { file_path: `/p/src/f${i}.mjs` } : { command: `node run ${i}` } }] });
+    msgs.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `t${i}`, text: `output ${i} `.repeat(50) }] });
+  }
+  msgs.push({ role: 'assistant', text: 'all done', toolUses: [] });
+  return msgs;
+}
+
+test('a real-shaped transcript (tool-result user messages, prose on assistant turns) yields cut points', () => {
+  const msgs = realShaped();
+  assert.ok(msgs.length >= 30);
+  const { cuts, candidates, tooEarly } = selectCutPoints(msgs, { cuts: 3 });
+  assert.equal(candidates, 14);
+  assert.equal(tooEarly, 4); // K=1, 3, 5, 7
+  assert.equal(cuts.length, 3);
+  for (const c of cuts) {
+    assert.equal(c.instruction, 'fix the flaky parser test');
+    assert.equal(c.instructionIndex, 0);
+    const prefix = msgs.slice(0, c.index);
+    assert.equal(prefix.length, c.index);
+    assert.ok(!prefix.includes(msgs[c.index])); // the acting message is not in the context
+    assert.ok(!renderContext(prefix).includes(JSON.stringify(msgs[c.index].toolUses[0].input)));
+  }
+});
+
+test('candidates whose rendered prefix exceeds --max-prefix-chars are counted as too_large, not truncated', () => {
+  const msgs = realShaped();
+  const all = selectCutPoints(msgs, { cuts: 99 });
+  const limit = renderContext(msgs.slice(0, 15)).length;
+  const capped = selectCutPoints(msgs, { cuts: 99, maxPrefixChars: limit });
+  assert.ok(capped.tooLarge > 0);
+  assert.equal(capped.cuts.length + capped.tooLarge, all.cuts.length);
+  assert.ok(capped.cuts.every((c) => renderContext(msgs.slice(0, c.index)).length <= limit));
+  assert.equal(capped.cuts.at(-1).index, 15);
+  assert.equal(selectCutPoints(msgs, { maxPrefixChars: 10 }).cuts.length, 0);
+});
+
+test('acting messages with no user instruction before them are counted as no_instruction', () => {
+  const act = (id) => ({ role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command: 'ls' } }] });
+  const result = (id) => ({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text: 'ok' }] });
+  const inj = { role: 'user', text: '<system-reminder>hi</system-reminder>', toolUses: [] };
+  const msgs = [inj, act('a'), result('a'), act('b'), result('b'), { role: 'user', text: 'now do the thing', toolUses: [] }, act('c')];
+  const sel = selectCutPoints(msgs, { minPrefix: 0 });
+  assert.equal(sel.candidates, 3);
+  assert.equal(sel.noInstruction, 2);
+  assert.deepEqual(sel.cuts.map((c) => c.index), [6]);
+  assert.equal(sel.cuts[0].instruction, 'now do the thing');
 });
 
 test('cut points are spread across the session, not clustered', () => {

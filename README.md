@@ -47,10 +47,10 @@ returns 404), so use a local checkout or its built `dist/` path.
 
 ## Does pruning cost the agent its task? (`fidelity.mjs`)
 
-Rewind and continue. Cut points are places in a real session where the user gave an
-instruction and the agent answered with a tool call, spread evenly across the session.
-At each one, a model gets the context before that point plus the real instruction, and
-must name the single next tool call. That answer is scored against the real one:
+Rewind and continue. Cut points are the agent's own tool calls (assistant messages with a
+tool use) that come after at least one user instruction, spread evenly across the session.
+At each one, a model gets the context before that message (never the message itself) plus
+the newest real user instruction, and must name the single next tool call. That answer is scored against the real one:
 1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool
 or an unparsable answer. Targets are compared after normalising paths and reducing shell
 commands to program plus first argument. No LLM judge.
@@ -76,7 +76,9 @@ OPENROUTER_API_KEY=... TYPESAFE_API_KEY=... node fidelity.mjs session.json \
 
 Options: `--cuts N` (5), `--thresholds LIST` (0.05,0.10,0.15,0.20,0.30,0.50), `--model`,
 `--provider claude|openrouter|fake` (claude), `--out PREFIX`, `--max-calls N` (60, the
-run aborts before calling if the plan is larger), `--dry-run`. Each real run makes
+run aborts before calling if the plan is larger), `--max-prefix-chars N` (80000; cut
+points whose rendered prefix is larger are skipped and reported as `too_large`, never
+truncated), `--dry-run`. Each real run makes
 `cuts x (1 + thresholds)` model calls plus at least one Jev request per cut point, and
 prints that before starting. The `claude` provider runs with tools off and no project
 context, from a scratch directory.
