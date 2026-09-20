@@ -1,0 +1,15 @@
+# session data and everything derived from it: never commit
+*.jsonl
+session.json
+*-decisions.json
+*-compacted.json
+*-summary.json
+report.html
+data/
+
+# secrets
+.env
+.env.*
+
+# deps
+node_modules/

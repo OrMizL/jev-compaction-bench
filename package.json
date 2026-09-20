@@ -1,0 +1,19 @@
+{
+  "name": "jev-compaction-bench",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Measure what context compaction deletes, and how confident the model was: a bench for Jev-guided (TypeSafe) pruning in Claude Code.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "adapt": "node adapt.mjs",
+    "run": "node run.mjs",
+    "inspect": "node inspect.mjs",
+    "report": "node report.mjs"
+  },
+  "keywords": ["claude-code", "compaction", "context", "jev", "typesafe", "agents", "evaluation"],
+  "dependencies": {}
+}
