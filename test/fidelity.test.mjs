@@ -11,7 +11,7 @@ import {
 } from '../fidelity.mjs';
 import { fakeProvider } from '../providers.mjs';
 
-const FIXTURE = new URL('./fixtures/session.json', import.meta.url).pathname;
+const FIXTURE = new URL('./fixtures/todo-cli-messages.json', import.meta.url).pathname;
 const messages = JSON.parse(readFileSync(FIXTURE, 'utf8'));
 
 // ---- cut-point selection

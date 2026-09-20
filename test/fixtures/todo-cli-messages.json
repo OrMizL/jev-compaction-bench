@@ -1,0 +1,399 @@
+[
+ {
+  "role": "user",
+  "text": "Set up a tiny todo CLI in this repo. Start by looking at the layout.",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_001",
+    "tool": "Bash",
+    "input": {
+     "command": "ls -la"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_001",
+    "text": "package.json\nREADME.md\nsrc\ntest\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_002",
+    "tool": "Read",
+    "input": {
+     "file_path": "/work/todo/package.json"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_002",
+    "text": "{ \"name\": \"todo\", \"type\": \"module\", \"scripts\": { \"test\": \"node --test\" } }",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_003",
+    "tool": "Read",
+    "input": {
+     "file_path": "/work/todo/src/todo.mjs"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_003",
+    "text": "// todo store\nconst items = [];\nexport function add(text) { items.push({ text, done: false }); return items.length; }\nexport function list() { return items.map((t, i) => `${i + 1}. [${t.done ? 'x' : ' '}] ${t.text}`); }\nexport function complete(n) { items[n - 1].done = true; }\n// todo store\nconst items = [];\nexport function add(text) { items.push({ text, done: false }); return items.length; }\nexport function list() { return items.map((t, i) => `${i + 1}. [${t.done ? 'x' : ' '}] ${t.text}`); }\nexport function complete(n) { items[n - 1].done = true; }\n// todo store\nconst items = [];\nexport function add(text) { items.push({ text, done: false }); return items.length; }\nexport function list() { return items.map((t, i) => `${i + 1}. [${t.done ? 'x' : ' '}] ${t.text}`); }\nexport function complete(n) { items[n - 1].done = true; }\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "I will add a remove function.",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_004",
+    "tool": "Edit",
+    "input": {
+     "file_path": "/work/todo/src/todo.mjs",
+     "old_string": "export function complete",
+     "new_string": "export function remove(n) { items.splice(n - 1, 1); }\nexport function complete"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_004",
+    "text": "ok",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "Now add a test for the remove function in test/todo.test.mjs.",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_005",
+    "tool": "Write",
+    "input": {
+     "file_path": "/work/todo/test/todo.test.mjs",
+     "content": "import test from 'node:test';\nimport { add, remove, list } from '../src/todo.mjs';\ntest('remove drops the item', () => { add('a'); remove(1); });\n"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_005",
+    "text": "File created",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_006",
+    "tool": "Bash",
+    "input": {
+     "command": "node --test"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_006",
+    "text": "TAP version 13\n# Subtest: remove drops the item\nnot ok 1 - remove drops the item\n  ---\n  error: 'remove is not a function'\n  stack: |\n    at TestContext.<anonymous> (test/todo.test.mjs:5:3)\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n  ...more stack frames...\n",
+    "isError": true
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "The export is missing from the barrel; fix the import path.",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_007",
+    "tool": "Edit",
+    "input": {
+     "file_path": "/work/todo/test/todo.test.mjs",
+     "old_string": "../src/todo.mjs",
+     "new_string": "../src/todo.mjs"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_007",
+    "text": "ok",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_008",
+    "tool": "Bash",
+    "input": {
+     "command": "node --test"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_008",
+    "text": "TAP version 13\nok 1 - remove drops the item\n# pass 1\n# fail 0\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "Great. Now document the new command in README.md.",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_009",
+    "tool": "Read",
+    "input": {
+     "file_path": "/work/todo/README.md"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_009",
+    "text": "# todo\n\nA tiny todo CLI.\n\n## Commands\n\n- `add <text>`\n- `list`\n- `done <n>`\n\nMore prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. More prose about the project so this result is long enough to be worth pruning. \n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_010",
+    "tool": "Edit",
+    "input": {
+     "file_path": "/work/todo/README.md",
+     "old_string": "- `done <n>`",
+     "new_string": "- `done <n>`\n- `remove <n>`"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_010",
+    "text": "ok",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "Run the linter and tell me what it says.",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_011",
+    "tool": "Bash",
+    "input": {
+     "command": "npm run lint"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_011",
+    "text": "> todo@1.0.0 lint\n> eslint .\n\n0 problems\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "The linter reports 0 problems.",
+  "toolUses": []
+ },
+ {
+  "role": "user",
+  "text": "Commit everything with the message \"add remove command\".",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_012",
+    "tool": "Bash",
+    "input": {
+     "command": "git add -A"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_012",
+    "text": "",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_013",
+    "tool": "Bash",
+    "input": {
+     "command": "git commit -m \"add remove command\""
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_013",
+    "text": "[main abc1234] add remove command\n 3 files changed\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "Finally, show me the git log.",
+  "toolUses": []
+ },
+ {
+  "role": "assistant",
+  "text": "",
+  "toolUses": [
+   {
+    "tool_use_id": "toolu_014",
+    "tool": "Bash",
+    "input": {
+     "command": "git log --oneline"
+    }
+   }
+  ]
+ },
+ {
+  "role": "user",
+  "text": "",
+  "toolUses": [],
+  "toolResults": [
+   {
+    "tool_use_id": "toolu_014",
+    "text": "abc1234 add remove command\n",
+    "isError": false
+   }
+  ]
+ },
+ {
+  "role": "assistant",
+  "text": "Done: one commit.",
+  "toolUses": []
+ }
+]
