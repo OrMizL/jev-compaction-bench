@@ -20,6 +20,8 @@ compactor that exposes per item decisions.
 | `run.mjs` | runs compaction at a chosen threshold against the live Jev API, prints stats and writes decisions to disk |
 | `inspect.mjs` | reports what was dropped: by tool, with error output, and whether a dropped target is still referenced elsewhere |
 | `report.mjs` | builds a single page HTML report with a threshold slider, so you can watch the decision ladder re-decide |
+| `fidelity.mjs` | rewinds a real session to points where the user gave an instruction, replays each with the full and the compacted context, and scores whether a model still takes the action the agent really took |
+| `providers.mjs` | the models `fidelity.mjs` can test: headless `claude -p`, any OpenAI-compatible endpoint, and a fake for tests |
 | `FINDINGS.md` | measured results, three real sessions, thresholds swept |
 
 ## Run it
@@ -43,6 +45,48 @@ node inspect.mjs session.json out-decisions.json
 (the library's README documents `npm install fast-jev-compaction`, but the registry
 returns 404), so use a local checkout or its built `dist/` path.
 
+## Does pruning cost the agent its task? (`fidelity.mjs`)
+
+Rewind and continue. Cut points are places in a real session where the user gave an
+instruction and the agent answered with a tool call, spread evenly across the session.
+At each one, a model gets the context before that point plus the real instruction, and
+must name the single next tool call. That answer is scored against the real one:
+1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool
+or an unparsable answer. Targets are compared after normalising paths and reducing shell
+commands to program plus first argument. No LLM judge.
+
+Conditions per cut point: `full` (the baseline) and the prefix compacted at each
+threshold in the sweep. If the baseline does not reproduce the real action, the cut
+point is marked `baseline_miss` and left out of scoring, and the report says how many.
+Jev is asked once per cut point and every threshold reuses those answers through the
+library's own decision ladder, so thresholds are compared on identical judgements.
+
+```bash
+# how many calls would this make? nothing is called
+node fidelity.mjs session.json --dry-run
+
+# headless Claude Code as the model under test, live Jev for compaction
+TYPESAFE_API_KEY=... JEV_LIB=fast-jev-compaction \
+  node fidelity.mjs session.json --cuts 5 --out run1
+
+# any OpenAI-compatible endpoint, for cheaper sweeps (OPENROUTER_BASE_URL overrides the host)
+OPENROUTER_API_KEY=... TYPESAFE_API_KEY=... node fidelity.mjs session.json \
+  --provider openrouter --model <model> --out run1
+```
+
+Options: `--cuts N` (5), `--thresholds LIST` (0.05,0.10,0.15,0.20,0.30,0.50), `--model`,
+`--provider claude|openrouter|fake` (claude), `--out PREFIX`, `--max-calls N` (60, the
+run aborts before calling if the plan is larger), `--dry-run`. Each real run makes
+`cuts x (1 + thresholds)` model calls plus at least one Jev request per cut point, and
+prints that before starting. The `claude` provider runs with tools off and no project
+context, from a scratch directory.
+
+Output: `PREFIX-fidelity.json` (raw answers, parsed and true actions, scores, context
+size before and after) and `PREFIX-fidelity.md` (threshold, mean agreement, mean context
+saved, baseline miss rate, and what was excluded and why). Both are gitignored because
+the json holds session text. Unparsable answers are kept with their raw text, counted as
+`unparsed`, and never silently dropped. Tests: `node --test` (fake provider only).
+
 ## Findings so far
 
 Three real Claude Code sessions, 99 / 153 / 78 tool calls, threshold swept at 0.15,
@@ -59,9 +103,9 @@ savings ranging from 7.8% to 57.9% across sessions.
 
 - measured: per item decisions, threshold sweep, integrity of the compacted output
   (no orphaned tool results, text preserved byte for byte), cost and latency
-- **not built yet**: the evaluation that answers the real question, "at this
-  threshold, can the agent still finish its task?" That is the next step, and the
-  reason this repo exists.
+- built, not yet run at scale: `fidelity.mjs`, the evaluation that answers the real
+  question, "at this threshold, can the agent still finish its task?" No results are
+  in `FINDINGS.md` yet.
 
 ## Caveats
 

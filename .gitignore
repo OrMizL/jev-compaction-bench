@@ -4,6 +4,8 @@ session.json
 *-decisions.json
 *-compacted.json
 *-summary.json
+*-fidelity.json
+*-fidelity.md
 report.html
 data/
 
