@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import {
   selectCutPoints, renderContext, normaliseTarget, sameTarget, scoreAction, parseAction,
   runFidelity, aggregate, buildMarkdown, fakeCompactor, main, planFor,
+  buildPrompt, parseToolLine, parseAnswer, baselineStatus, formatPlan,
 } from '../fidelity.mjs';
 import { fakeProvider } from '../providers.mjs';
 
@@ -174,9 +175,10 @@ test('unparsed answers are recorded with raw text, flagged, and never dropped', 
   const [r] = results;
   assert.equal(r.status, 'scored');
   const bad = r.conditions[0];
-  assert.equal(bad.unparsed, true);
-  assert.equal(bad.parsed, null);
-  assert.equal(bad.raw, 'no idea, sorry');
+  assert.equal(bad.unparsed, 1); // count of unparsed samples
+  assert.equal(bad.samples[0].unparsed, true);
+  assert.equal(bad.samples[0].parsed, null);
+  assert.equal(bad.samples[0].raw, 'no idea, sorry');
   assert.equal(bad.score, 0);
   const agg = aggregate(results, [0.1, 0.3]);
   assert.equal(agg[0].unparsed, 1);
@@ -191,7 +193,8 @@ test('a provider failure is an error with no score, not a zero', async () => {
   const results = await runFidelity({ messages, cuts, thresholds: [0.1, 0.3], provider, compactor: fakeCompactor() });
   const [c1, c2] = results[0].conditions;
   assert.equal(c1.score, null);
-  assert.equal(c1.error, 'boom');
+  assert.equal(c1.errors, 1);
+  assert.equal(c1.samples[0].error, 'boom');
   assert.equal(c2.score, 1);
   const agg = aggregate(results, [0.1, 0.3]);
   assert.equal(agg[0].errors, 1);
@@ -220,14 +223,14 @@ test('an unparsable baseline is also a baseline miss', async () => {
   const { cuts } = selectCutPoints(messages, { cuts: 1 });
   const results = await runFidelity({ messages, cuts, thresholds: [0.15], provider: fakeProvider('hello'), compactor: fakeCompactor() });
   assert.equal(results[0].status, 'baseline_miss');
-  assert.equal(results[0].baseline.unparsed, true);
-  assert.equal(results[0].baseline.raw, 'hello');
+  assert.equal(results[0].baseline.samples[0].unparsed, true);
+  assert.equal(results[0].baseline.samples[0].raw, 'hello');
 });
 
 test('context shrinks with the threshold and savings are recorded before/after', async () => {
   const { cuts } = selectCutPoints(messages, { cuts: 5 });
   // answer with the real action for whichever cut point the instruction belongs to
-  const provider = fakeProvider((_s, _c, instruction) => truthOf(cuts.find((c) => instruction.includes(c.instruction))));
+  const provider = fakeProvider((_s, context) => truthOf(cuts.find((c) => context.includes(`not a new request):\n${c.instruction}\n\nMOST RECENT`))));
   const results = await runFidelity({ messages, cuts, thresholds: [0.05, 0.5], provider, compactor: fakeCompactor() });
   assert.ok(results.every((r) => r.status === 'scored'));
   const c = results[2]; // K=23: a prefix with long tool results to truncate
@@ -288,5 +291,180 @@ test('a full fake run writes both output files', async () => {
     const json = JSON.parse(readFileSync(`${out}-fidelity.json`, 'utf8'));
     assert.equal(json.cutPoints.length, 2);
     assert.match(readFileSync(`${out}-fidelity.md`, 'utf8'), /## Threshold sweep/);
+  } finally { rmSync(dir, { recursive: true }); }
+});
+
+// ---- prompt styles
+
+test('situation prompt labels the standing task as background and the state as most recent', () => {
+  const transcript = renderContext(messages.slice(0, 10));
+  const p = buildPrompt('situation', transcript, 'build the todo cli');
+  assert.match(p.context, /STANDING TASK \(may be old; background only, not a new request\):\nbuild the todo cli/);
+  assert.match(p.context, /MOST RECENT STATE \(oldest first; ends with the newest observation\):\n<transcript>/);
+  assert.ok(p.context.indexOf('STANDING TASK') < p.context.indexOf('MOST RECENT STATE'));
+  assert.ok(p.context.endsWith(transcript)); // the state ends with the newest observation
+  assert.match(p.instruction, /TOOL <name> <target>/);
+  assert.match(p.system, /background, not a new/);
+  assert.doesNotMatch(p.context + p.instruction, /Newest user instruction/);
+});
+
+test('legacy prompt keeps the old wording and JSON answer format', () => {
+  const p = buildPrompt('legacy', '<transcript>x</transcript>', 'do it');
+  assert.equal(p.context, '<transcript>x</transcript>');
+  assert.match(p.instruction, /^Newest user instruction:\ndo it/);
+  assert.match(p.system, /exactly one line of JSON/);
+  assert.doesNotMatch(p.context, /STANDING TASK/);
+  assert.throws(() => buildPrompt('nope', '', ''), /unknown prompt style/);
+});
+
+test('both prompt styles run end to end and send their own prompt', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  for (const style of ['situation', 'legacy']) {
+    const seen = [];
+    const provider = fakeProvider((system, context, instruction) => { seen.push({ system, context, instruction }); return truthOf(cuts[0]); });
+    const results = await runFidelity({ messages, cuts, thresholds: [0.3], provider, compactor: fakeCompactor(), promptStyle: style });
+    assert.equal(results[0].status, 'scored');
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].context.includes('STANDING TASK'), style === 'situation');
+    assert.equal(seen[0].instruction.includes('Newest user instruction'), style === 'legacy');
+  }
+});
+
+test('situation answers in TOOL <name> <target> form are parsed and scored', () => {
+  assert.deepEqual(parseToolLine('TOOL Read /p/src/a.mjs'), { tool: 'Read', input: {}, target: '/p/src/a.mjs' });
+  assert.deepEqual(parseToolLine('Sure.\n`TOOL Bash "git status --short"`'), { tool: 'Bash', input: {}, target: 'git status --short' });
+  assert.equal(parseToolLine('TOOL TodoWrite').target, '');
+  assert.equal(parseToolLine('I would read the file'), null);
+  assert.equal(parseToolLine('Tool use is fine'), null);
+  // JSON is still accepted in situation style, but never the TOOL form in legacy style
+  assert.deepEqual(parseAnswer('situation', '{"tool":"Bash","input":{"command":"ls"}}'), { tool: 'Bash', input: { command: 'ls' } });
+  assert.equal(parseAnswer('legacy', 'TOOL Bash ls'), null);
+
+  const read = { tool: 'Read', input: { file_path: '/home/x/proj/src/a.mjs' } };
+  const bash = { tool: 'Bash', input: { command: 'cd /w && node --test test/' } };
+  assert.equal(scoreAction(read, parseToolLine('TOOL Read src/a.mjs')), 1);
+  assert.equal(scoreAction(read, parseToolLine('TOOL Read src/b.mjs')), 0.5);
+  assert.equal(scoreAction(read, parseToolLine('TOOL Read')), 0.5);
+  assert.equal(scoreAction(read, parseToolLine('TOOL Edit src/a.mjs')), 0);
+  assert.equal(scoreAction(bash, parseToolLine('TOOL Bash node --test test/')), 1);
+  assert.equal(scoreAction(bash, parseToolLine('TOOL Bash git status')), 0.5);
+  assert.equal(scoreAction({ tool: 'TodoWrite', input: { todos: [] } }, parseToolLine('TOOL TodoWrite')), 1);
+});
+
+// ---- repeats
+
+// Per-cut-point call order with repeats R: R baseline samples, then R per threshold.
+function repeatsRun(baselineHits, repeats = 3) {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  const wrong = '{"tool":"Glob","input":{"pattern":"*"}}';
+  const provider = fakeProvider((_s, _c, _i, n) => (n <= repeats ? (baselineHits[n - 1] ? truthOf(cuts[0]) : wrong) : truthOf(cuts[0])));
+  return runFidelity({ messages, cuts, thresholds: [0.3], provider, compactor: fakeCompactor(), repeats }).then((results) => ({ results, provider }));
+}
+
+test('repeats: a baseline matching in 1 of 3 repeats is excluded, 2 of 3 is kept', async () => {
+  const one = await repeatsRun([true, false, false]);
+  assert.equal(one.results[0].status, 'baseline_miss');
+  assert.equal(one.results[0].baseline.exact, 1);
+  assert.equal(one.results[0].conditions.length, 0);
+  assert.equal(one.provider.calls, 3); // no compacted conditions were sampled
+
+  const two = await repeatsRun([true, false, true]);
+  assert.equal(two.results[0].status, 'scored');
+  assert.equal(two.results[0].baseline.exact, 2);
+  assert.equal(two.provider.calls, 3 + 3);
+  assert.equal(two.results[0].conditions[0].repeats, 3);
+});
+
+test('repeats: even N needs half (ceil(N/2)), and errors that could tip the verdict make it baseline_error', () => {
+  const b = (repeats, exact, errors) => ({ repeats, exact, errors });
+  assert.equal(baselineStatus(b(4, 2, 0)), 'scored');
+  assert.equal(baselineStatus(b(4, 1, 0)), 'baseline_miss');
+  assert.equal(baselineStatus(b(3, 1, 0)), 'baseline_miss');
+  assert.equal(baselineStatus(b(3, 1, 1)), 'baseline_error'); // the failed call might have matched
+  assert.equal(baselineStatus(b(3, 0, 1)), 'baseline_miss'); // misses even if it had
+  assert.equal(baselineStatus(b(1, 0, 1)), 'baseline_error');
+  assert.equal(baselineStatus(b(1, 1, 0)), 'scored');
+});
+
+test('repeats: condition reports mean, min, max and repeat count; errored samples are counted, not averaged', async () => {
+  const { cuts } = selectCutPoints(messages, { cuts: 1 });
+  const truth = JSON.parse(truthOf(cuts[0]));
+  const same = truthOf(cuts[0]);
+  const half = JSON.stringify({ tool: truth.tool, input: { file_path: '/elsewhere/x', command: 'zz', pattern: 'zz', path: '/elsewhere/x' } });
+  // baseline 3 exact; threshold: exact, half, then a failed call
+  const answers = [same, same, same, same, half, 'FAIL'];
+  let n = 0;
+  const provider = { name: 'fake', calls: 0, async respond() { this.calls++; const a = answers[n++]; if (a === 'FAIL') throw new Error('boom'); return a; } };
+  const results = await runFidelity({ messages, cuts, thresholds: [0.3], provider, compactor: fakeCompactor(), repeats: 3 });
+  const c = results[0].conditions[0];
+  assert.equal(results[0].status, 'scored');
+  assert.deepEqual([c.repeats, c.n, c.errors], [3, 2, 1]);
+  assert.equal(c.score, 0.75);
+  assert.equal(c.min, 0.5);
+  assert.equal(c.max, 1);
+  const [a] = aggregate(results, [0.3]);
+  assert.deepEqual([a.n, a.samples, a.errors], [1, 2, 1]);
+  assert.equal(a.meanAgreement, 0.75);
+  assert.equal(a.minSample, 0.5);
+  assert.equal(a.maxSample, 1);
+  const md = buildMarkdown({ date: 'd', provider: 'fake', repeats: 3, promptStyle: 'situation', modelCalls: 6, jevRequests: 0, candidates: 1, tooEarly: 0 }, results, [0.3]);
+  assert.match(md, /0\.75 \[0\.50-1\.00\] n=2 e1/);
+  assert.match(md, /3 repeats per condition/);
+});
+
+// ---- plan arithmetic with repeats
+
+test('plan counts repeats in the model calls and the budget check', () => {
+  const args = { cuts: [1, 2, 3, 4], thresholds: [0.15, 0.2, 0.25] };
+  const p = planFor({ ...args, repeats: 3, maxCalls: 90 });
+  assert.equal(p.modelCalls, 4 * 4 * 3); // cuts x (baseline + thresholds) x repeats
+  assert.equal(p.jevRequests, 4); // Jev is asked once per cut point, not once per repeat
+  assert.equal(p.total, 52);
+  assert.equal(p.overBudget, false);
+  assert.equal(planFor({ ...args, repeats: 3, maxCalls: 51 }).overBudget, true);
+  assert.equal(planFor({ ...args, maxCalls: 90 }).modelCalls, 16); // repeats default to 1
+});
+
+test('--repeats is in the dry-run count and a plan over --max-calls aborts before any call, without reducing anything', async () => {
+  const lines = [];
+  const provider = fakeProvider();
+  const argv = [FIXTURE, '--cuts', '2', '--thresholds', '0.15,0.2', '--repeats', '3'];
+  assert.equal(await main([...argv, '--dry-run', '--max-calls', '30'], { provider, log: (l) => lines.push(l) }), 0);
+  assert.match(lines.join('\n'), /calls: 18 model \(2 cuts x 3 conditions x 3 repeats\) \+ >=2 Jev = 20 \(max 30\)/);
+  assert.match(lines.join('\n'), /prompt style: situation, repeats: 3/);
+
+  lines.length = 0;
+  const code = await main([...argv, '--max-calls', '19', '--out', '/nonexistent/x'], { provider, compactor: fakeCompactor(), log: (l) => lines.push(l) });
+  assert.equal(code, 2);
+  assert.equal(provider.calls, 0);
+  assert.match(lines.join('\n'), /ABORT: plan of 20 calls exceeds --max-calls 19; nothing was reduced/);
+  assert.match(lines.join('\n'), /calls: 18 model/); // the plan still shows the real, unreduced count
+});
+
+test('--repeats and --prompt-style are validated', async () => {
+  const errs = [];
+  const orig = console.error; console.error = (m) => errs.push(m);
+  try {
+    assert.equal(await main([FIXTURE, '--repeats', '0', '--dry-run']), 2);
+    assert.equal(await main([FIXTURE, '--prompt-style', 'wat', '--dry-run']), 2);
+  } finally { console.error = orig; }
+  assert.match(errs.join('\n'), /--repeats must be a positive integer/);
+  assert.match(errs.join('\n'), /unknown prompt style "wat"/);
+});
+
+test('a full fake run with repeats and both prompt styles writes reports that state them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fid-'));
+  try {
+    for (const style of ['situation', 'legacy']) {
+      const out = join(dir, style);
+      const code = await main([FIXTURE, '--provider', 'fake', '--cuts', '2', '--thresholds', '0.15', '--repeats', '2', '--prompt-style', style, '--out', out], { log: () => {} });
+      assert.equal(code, 0);
+      const json = JSON.parse(readFileSync(`${out}-fidelity.json`, 'utf8'));
+      assert.equal(json.meta.repeats, 2);
+      assert.equal(json.meta.promptStyle, style);
+      const scored = json.cutPoints.filter((r) => r.status === 'scored').length;
+      assert.equal(json.meta.modelCalls, 2 * (2 + scored)); // repeats x (2 baselines + 1 threshold per scored cut)
+      assert.match(readFileSync(`${out}-fidelity.md`, 'utf8'), new RegExp(`Prompt style \`${style}\`, 2 repeats per condition`));
+    }
   } finally { rmSync(dir, { recursive: true }); }
 });

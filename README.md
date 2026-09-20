@@ -49,8 +49,12 @@ returns 404), so use a local checkout or its built `dist/` path.
 
 Rewind and continue. Cut points are the agent's own tool calls (assistant messages with a
 tool use) that come after at least one user instruction, spread evenly across the session.
-At each one, a model gets the context before that message (never the message itself) plus
-the newest real user instruction, and must name the single next tool call. That answer is scored against the real one:
+At each one, a model gets the context before that message (never the message itself) and
+must name the single next tool call. The prompt frames a mid-task situation: the newest real
+user prose as a `standing task (may be old)`, labelled as background, then the rendered prefix as
+the `most recent state`, then one ask (`TOOL <name> <target>`). `--prompt-style legacy`
+sends the old fresh-instruction/JSON prompt instead, for comparison on the same cut points.
+That answer is scored against the real one:
 1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool
 or an unparsable answer. Targets are compared after normalising paths and reducing shell
 commands to program plus first argument. No LLM judge.
@@ -58,6 +62,9 @@ commands to program plus first argument. No LLM judge.
 Conditions per cut point: `full` (the baseline) and the prefix compacted at each
 threshold in the sweep. If the baseline does not reproduce the real action, the cut
 point is marked `baseline_miss` and left out of scoring, and the report says how many.
+Every condition is sampled `--repeats N` times (default 1); the baseline counts as
+reproduced when at least `ceil(N/2)` repeats score exactly 1.0, and each condition reports
+its mean, min, max and repeat count. Failed model calls are counted as errors and left out of means.
 Jev is asked once per cut point and every threshold reuses those answers through the
 library's own decision ladder, so thresholds are compared on identical judgements.
 
@@ -78,9 +85,10 @@ Options: `--cuts N` (5), `--thresholds LIST` (0.05,0.10,0.15,0.20,0.30,0.50), `-
 `--provider claude|openrouter|fake` (claude), `--out PREFIX`, `--max-calls N` (60, the
 run aborts before calling if the plan is larger), `--max-prefix-chars N` (80000; cut
 points whose rendered prefix is larger are skipped and reported as `too_large`, never
-truncated), `--dry-run`. Each real run makes
-`cuts x (1 + thresholds)` model calls plus at least one Jev request per cut point, and
-prints that before starting. The `claude` provider runs with tools off and no project
+truncated), `--repeats N` (1), `--prompt-style situation|legacy` (situation), `--dry-run`.
+Each real run makes `cuts x (1 + thresholds) x repeats` model calls plus at least one Jev
+request per cut point, and prints that before starting. Nothing is trimmed to fit
+`--max-calls`: an over-budget plan aborts before the first call. The `claude` provider runs with tools off and no project
 context, from a scratch directory.
 
 Output: `PREFIX-fidelity.json` (raw answers, parsed and true actions, scores, context
