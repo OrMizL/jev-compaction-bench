@@ -1,132 +1,142 @@
 # jev-compaction-bench
 
-Measure whether context pruning is safe, instead of assuming it.
+Can an AI agent's memory be trimmed safely?
 
-Agents free up room by deleting or summarizing old context. Tools that do this
-compaction ask you to trust them. This repo measures the parts nobody measures:
-what actually gets deleted, how confident the model was in each decision, and
-whether anything load bearing went with it.
+Agents free up room by deleting old context. Tools that do this ask you to trust them. This repo
+measures what that costs, instead of assuming it.
 
-It was built to test [`fast-jev-compaction`](https://github.com/tamaratran/fast-jev-compaction),
-a Claude Code plugin that asks TypeSafe's Jev model whether each old tool call and
-result is still needed, then deletes what it says is not. The same rig works for any
-compactor that exposes per item decisions.
+### The problem
+A coding agent works for a long time. Its context fills up, and something has to delete the old material
+to make room. The tool we tested asks a fast AI model, "is this old tool call and its result still
+needed?" and deletes whatever it says no to.
+
+Nobody knows what that costs. It frees the most room, and it quietly removes the material the agent was
+working from.
+
+### The test
+We take a real recorded session. We rewind to a moment in the middle, show the agent everything that had
+happened up to that point, and ask: what do you do next? We compare that to what it actually did at that
+moment. Then we run the same moment again with the context trimmed.
+
+If trimming costs nothing, the answer comes back the same. If it costs something, the answer changes.
+
+### The safety check
+Before comparing anything, we confirm the agent gets the right answer when nothing is trimmed. If it
+cannot, that moment is a bad test and we throw it out, rather than blaming trimming for it. This is what
+every result below is conditional on.
+
+### The result
+Stated at the precision the evidence supports:
+
+> Preliminary result from one recording: across the three of four selected moments where the full-context
+> baseline reproduced the recorded next tool and normalized target, threshold 0.25 matched that
+> signature in 8 of 9 samples (mean normalized agreement 0.89) while removing 47.8% to 59.4% of
+> rendered context. At threshold 0.50, the same moments matched in 1 of 9 samples (mean 0.28) while
+> removing 64.2% to 93.9%. One moment was excluded because its own control did not reproduce the
+> recorded action. There were no unparsed answers and no provider errors. This suggests the default can
+> remove action-relevant context here; it does not establish a generally safe threshold, semantic
+> action equivalence, or task completion.
+
+In plainer words: at the milder setting the agent produced the same next action in 8 of 9 tries; at the
+default, 1 of 9. That points at the default removing material the agent still needed, on this session.
+It is not a safety boundary, and it is not proof that trimming is generally safe below some percentage.
+
+### Limitations
+- One recorded session, one model, one task type. Four moments were selected; three had a control that
+  reproduced the recorded action, and only those three are counted.
+- Three samples per condition, so nine samples per threshold.
+- The measure is **normalized next-action agreement**: the same tool against the same normalized target.
+  Two different edits to the same file count as a match. It is not task success, and it says nothing
+  about correctness or about what information the agent retained generally.
+- Threshold is not a fixed percentage saved. The same value removed different amounts at different
+  moments: 47.8% to 59.4% at 0.25, and 64.2% to 93.9% at 0.5.
+
+### Why it matters
+The project this measures has dozens of proposed fixes and no way to tell which are safe. A measurement
+of what trimming does to an agent's next action, even a preliminary one, is a missing referee.
+
+---
+
+## Reproduce it
+
+```bash
+git clone https://github.com/OrMizL/jev-compaction-bench && cd jev-compaction-bench
+
+# 1. a Claude Code session log -> the message array the harness takes
+node adapt.mjs ~/.claude/projects/<slug>/<session-id>.jsonl session.json
+
+# 2. plan the run (makes no calls, needs no key)
+node fidelity.mjs session.json --dry-run --cuts 4 --repeats 3 --thresholds 0.25,0.5
+
+# 3. run it: model under test + live Jev for compaction
+TYPESAFE_API_KEY=... JEV_LIB=fast-jev-compaction \\
+  node fidelity.mjs session.json --cuts 4 --repeats 3 --thresholds 0.25,0.5 \\
+  --max-prefix-chars 250000 --out run1
+
+# 4. the report
+cat run1-fidelity.md
+```
+
+Requirements: Node 18+, a TypeSafe API key (early access, waitlisted, also available through gateways
+such as Vercel or Cloudflare), and a session log. `JEV_LIB` points at the compaction library; it is
+**not published to npm** at the time of writing (the library's README documents
+`npm install fast-jev-compaction`, but the registry returns 404), so point it at a local checkout or its
+built `dist/`.
 
 ## What is in here
 
 | file | what it does |
 |---|---|
-| `adapt.mjs` | reads a Claude Code session log (`.jsonl`) and reshapes it into the message array a compaction library expects |
-| `run.mjs` | runs compaction at a chosen threshold against the live Jev API, prints stats and writes decisions to disk |
-| `inspect.mjs` | reports what was dropped: by tool, with error output, and whether a dropped target is still referenced elsewhere |
-| `report.mjs` | builds a single page HTML report with a threshold slider, so you can watch the decision ladder re-decide |
-| `fidelity.mjs` | rewinds a real session to points where the user gave an instruction, replays each with the full and the compacted context, and scores whether a model still takes the action the agent really took |
+| `fidelity.mjs` | the rewind-and-continue evaluation: cut-point selection, the full and compacted conditions, scoring, reports, CLI |
 | `providers.mjs` | the models `fidelity.mjs` can test: headless `claude -p`, any OpenAI-compatible endpoint, and a fake for tests |
-| `FINDINGS.md` | measured results, three real sessions, thresholds swept |
+| `adapt.mjs` | Claude Code session log (`.jsonl`) to the message array the harness takes |
+| `run.mjs` | runs compaction at a chosen threshold against the live Jev API, prints stats and writes decisions |
+| `inspect.mjs` | what was dropped: by tool, with error output, and whether a dropped target is still referenced |
+| `report.mjs` | single page HTML report with a threshold slider, so you can watch the decision ladder re-decide |
+| `FINDINGS.md` | the decision-level measurements: three real sessions, thresholds swept |
+| `specs/` | the build specs, in the order they were written, including the bugs each one fixed |
 
-## Run it
+## How the scoring works
 
-Requirements: Node 18+, a TypeSafe API key (early access, currently waitlisted, also
-available through gateways such as Vercel or Cloudflare), and a session log at
-`~/.claude/projects/<path-slug>/<session-id>.jsonl`.
+1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool or an
+unparsable answer. No LLM judge. Targets are compared after normalising paths. A shell command is
+compared by signature (its program, any `python3 -m` module, and the set of paths it names), so an inline
+script rewritten against the same files still matches: same program and paths 1.0, same program other
+paths 0.5, another program 0.0. A truth command naming no path is flagged `loose_target` and scored by a
+weaker rule, and the reports count those per threshold.
 
-```bash
-# 1. session log -> messages array
-node adapt.mjs ~/.claude/projects/<slug>/<id>.jsonl session.json
+Conditions per moment: `full` (the baseline) and the prefix compacted at each threshold. If the baseline
+does not reproduce the real action, the moment is `baseline_miss` and is excluded, and the report says how
+many. Every condition is sampled `--repeats N` times; the baseline counts as reproduced when at least
+`ceil(N/2)` repeats score exactly 1.0. Jev is asked once per moment and every threshold reuses those
+answers through the library's own decision ladder, so thresholds are compared on identical judgements.
 
-# 2. compact at a threshold, live
-TYPESAFE_API_KEY=... JEV_LIB=fast-jev-compaction node run.mjs session.json out 0.15
+Options: `--cuts N`, `--thresholds LIST`, `--model`, `--provider claude|openrouter|fake`, `--out PREFIX`,
+`--max-calls N` (aborts before calling if the plan is larger; nothing is trimmed to fit),
+`--max-prefix-chars N` (oversized prefixes are skipped and reported as `too_large`, never truncated),
+`--repeats N`, `--prompt-style situation|legacy`, `--dry-run`.
 
-# 3. what did it drop?
-node inspect.mjs session.json out-decisions.json
-```
-
-`JEV_LIB` points at the library. It is **not published to npm** at the time of writing
-(the library's README documents `npm install fast-jev-compaction`, but the registry
-returns 404), so use a local checkout or its built `dist/` path.
-
-## Does pruning cost the agent its task? (`fidelity.mjs`)
-
-Rewind and continue. Cut points are the agent's own tool calls (assistant messages with a
-tool use) that come after at least one user instruction, spread evenly across the session.
-At each one, a model gets the context before that message (never the message itself) and
-must name the single next tool call. The prompt frames a mid-task situation: the newest real
-user prose as a `standing task (may be old)`, labelled as background, then the rendered prefix as
-the `most recent state`, then one ask (`TOOL <name> <target>`). `--prompt-style legacy`
-sends the old fresh-instruction/JSON prompt instead, for comparison on the same cut points.
-That answer is scored against the real one:
-1.0 same tool and same target, 0.5 same tool with a different target, 0.0 different tool
-or an unparsable answer. Targets are compared after normalising paths. A shell command is
-compared by signature (its program, `python3 -m` module and the set of paths it names), so an
-inline script rewritten against the same files still matches: same program, module and paths
-1.0, same program with other paths 0.5, another program 0.0. A truth command that names no
-path is flagged `loose_target` and scored by the older program-plus-first-argument rule; the
-reports count those per threshold. No LLM judge.
-
-Conditions per cut point: `full` (the baseline) and the prefix compacted at each
-threshold in the sweep. If the baseline does not reproduce the real action, the cut
-point is marked `baseline_miss` and left out of scoring, and the report says how many.
-Every condition is sampled `--repeats N` times (default 1); the baseline counts as
-reproduced when at least `ceil(N/2)` repeats score exactly 1.0, and each condition reports
-its mean, min, max and repeat count. Failed model calls are counted as errors and left out of means.
-Jev is asked once per cut point and every threshold reuses those answers through the
-library's own decision ladder, so thresholds are compared on identical judgements.
-
-```bash
-# how many calls would this make? nothing is called
-node fidelity.mjs session.json --dry-run
-
-# headless Claude Code as the model under test, live Jev for compaction
-TYPESAFE_API_KEY=... JEV_LIB=fast-jev-compaction \
-  node fidelity.mjs session.json --cuts 5 --out run1
-
-# any OpenAI-compatible endpoint, for cheaper sweeps (OPENROUTER_BASE_URL overrides the host)
-OPENROUTER_API_KEY=... TYPESAFE_API_KEY=... node fidelity.mjs session.json \
-  --provider openrouter --model <model> --out run1
-```
-
-Options: `--cuts N` (5), `--thresholds LIST` (0.05,0.10,0.15,0.20,0.30,0.50), `--model`,
-`--provider claude|openrouter|fake` (claude), `--out PREFIX`, `--max-calls N` (60, the
-run aborts before calling if the plan is larger), `--max-prefix-chars N` (80000; cut
-points whose rendered prefix is larger are skipped and reported as `too_large`, never
-truncated), `--repeats N` (1), `--prompt-style situation|legacy` (situation), `--dry-run`.
-Each real run makes `cuts x (1 + thresholds) x repeats` model calls plus at least one Jev
-request per cut point, and prints that before starting. Nothing is trimmed to fit
-`--max-calls`: an over-budget plan aborts before the first call. The `claude` provider runs with tools off and no project
-context, from a scratch directory.
-
-Output: `PREFIX-fidelity.json` (raw answers, parsed and true actions, scores, context
-size before and after) and `PREFIX-fidelity.md` (threshold, mean agreement, mean context
-saved, baseline miss rate, what was excluded and why, and each cut point's real action next
-to the signature it was scored by). Both are gitignored because they hold session text. Unparsable answers are kept with their raw text, counted as
-`unparsed`, and never silently dropped. Tests: `node --test` (fake provider only).
-
-## Findings so far
-
-Three real Claude Code sessions, 99 / 153 / 78 tool calls, threshold swept at 0.15,
-0.30 and 0.50. Full tables in [`FINDINGS.md`](./FINDINGS.md).
-
-The short version: the shipped default threshold of 0.5 keeps **zero** non pinned
-calls, because Jev's answers sit around 0.14 to 0.17 for "result still needed" and
-0.28 to 0.35 for "call still matters". Any threshold above roughly 0.2 makes both
-positive branches of the decision ladder unreachable, so everything falls through to
-deletion. The usable range is about 0.10 to 0.25, and a single fixed number meant
-savings ranging from 7.8% to 57.9% across sessions.
+Output: `PREFIX-fidelity.json` and `PREFIX-fidelity.md`, both gitignored because they hold session text.
 
 ## Status
 
-- measured: per item decisions, threshold sweep, integrity of the compacted output
-  (no orphaned tool results, text preserved byte for byte), cost and latency
-- built, not yet run at scale: `fidelity.mjs`, the evaluation that answers the real
-  question, "at this threshold, can the agent still finish its task?" No results are
-  in `FINDINGS.md` yet.
+- Built and run: the fidelity evaluation above, on one recorded session.
+- Built and measured: the decision-level sweep in `FINDINGS.md`, which is how the 0.5 default was caught
+  in the first place (it keeps zero non-pinned calls).
+- Not done: a second session with a different task shape; scoring proposed fixes against each other at
+  matched savings; and a `compact(messages, options)` interface so any pruner, not just this one, can be
+  plugged in. Today this is a bench for one plugin, and the method is the part that generalises.
 
 ## Caveats
 
-- Jev's answers have small run to run variance, so a threshold simulation built from
-  one run is not a byte exact replay of what the library would return on a fresh call.
-- The adapter drops `thinking` blocks when reshaping a transcript, which produces
-  empty messages on input. That is a property of this tool, not of the library.
+- One model under test (headless Claude Code), one prompt style per comparison, one session. Treat this
+  as a preliminary measurement, which is how it is written.
+- Unparsable answers are counted and reported per threshold, but they are currently scored as 0 agreement
+  and included in the means. Read the `unparsed` column next to any mean that matters.
+- The adapter drops `thinking` blocks when reshaping a transcript, which yields empty messages on input.
+  That is a property of this tool, not of the library.
+- Jev's answers have small run-to-run variance, so a threshold simulation built from one run is not a
+  byte-exact replay of a fresh call.
 - Not affiliated with TypeSafe or with the author of `fast-jev-compaction`.
 
 ## License
