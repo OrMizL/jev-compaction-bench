@@ -51,6 +51,20 @@ It is not a safety boundary, and it is not proof that trimming is generally safe
 - Threshold is not a fixed percentage saved. The same value removed different amounts at different
   moments: 47.8% to 59.4% at 0.25, and 64.2% to 93.9% at 0.5.
 
+### Which sessions can be measured
+The method needs moments where the recorded next action is **determined by the visible context**. A
+debugging session usually qualifies, because the next step is forced by the error just seen. A long
+autonomous build driven by a plan often does not: the agent's next step comes from a private plan the
+transcript does not expose, so several continuations are valid and the control fails.
+
+A second session attempted here (381 messages, 153 tool calls, an app-scaffolding build) failed its
+control at **all four** moments and produced no measurement at all. For example, after a template
+download that was visible in the context, the recorded agent read one specific file while a model given
+the identical state proposed copying the downloaded template into place. Both are reasonable; the
+recorded one came from planning we cannot see. The harness declined to score any of it, which is the
+safety check working, not evidence about trimming. The numbers above come from the one session that
+qualified.
+
 ### Why it matters
 The project this measures has dozens of proposed fixes and no way to tell which are safe. A measurement
 of what trimming does to an agent's next action, even a preliminary one, is a missing referee.
